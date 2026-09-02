@@ -9,6 +9,7 @@ import asyncio
 import errno
 import inspect
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -28,6 +29,7 @@ _CODEX_ENV = (
     "ANTHROPIC_CUSTOM_HEADERS",
     "LLM_GATEWAY_KEY",
     "CODEX_HOME",
+    "HYPERLOOM_CODEX_CLI_AUTH",
     "HYPERLOOM_CODEX_SANDBOX_MODE",
     "HYPERLOOM_RUNTIME_DIR",
 )
@@ -56,6 +58,27 @@ def _gateway_env(**extra: str) -> dict[str, str]:
     }
     env.update(extra)
     return env
+
+
+def _cli_auth_env(root: Path) -> dict[str, str]:
+    """Build an opted-in, mode-0600 fake ChatGPT CLI login."""
+    codex_home = root / "operator-codex-home"
+    codex_home.mkdir()
+    auth_path = codex_home / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": "fake-access", "refresh_token": "fake-refresh"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    auth_path.chmod(0o600)
+    return {
+        cs.CODEX_CLI_AUTH_ENV: "1",
+        "CODEX_HOME": str(codex_home),
+    }
 
 
 def _override_value(overrides: tuple[str, ...], key: str) -> str:
@@ -190,9 +213,12 @@ class _FakeAsyncCodex:
 
     async def __aenter__(self) -> "_FakeAsyncCodex":
         codex_home = Path(self._record["config"].kwargs["env"]["CODEX_HOME"])
+        auth_path = codex_home / "auth.json"
         self._record["codex_home_at_enter"] = str(codex_home)
         self._record["codex_home_exists_at_enter"] = codex_home.is_dir()
         self._record["codex_home_mode_at_enter"] = codex_home.stat().st_mode & 0o777
+        self._record["cli_auth_exists_at_enter"] = auth_path.is_file()
+        self._record["cli_auth_mode_at_enter"] = auth_path.stat().st_mode & 0o777 if auth_path.is_file() else None
         return self
 
     async def __aexit__(self, *_exc: Any) -> bool:
@@ -416,7 +442,38 @@ def test_api_key_env_name_lists_every_candidate_when_none_is_set():
     assert "LLM_GATEWAY_KEY" in message
 
 
-# --------------------------------------------------------------------------- # Sandbox and approval selection
+def test_runtime_auth_uses_opted_in_cli_login_without_gateway_overrides(tmp_path):
+    env = _cli_auth_env(tmp_path)
+
+    resolved = cs.resolve_codex_runtime_auth(env=env)
+
+    assert resolved.model_provider is None
+    assert resolved.provider.overrides == ()
+    assert resolved.provider.env_additions == ()
+    assert resolved.cli_auth_source == Path(env["CODEX_HOME"]) / "auth.json"
+
+
+def test_runtime_auth_keeps_explicit_gateway_priority_over_cli_login(tmp_path):
+    env = {**_cli_auth_env(tmp_path), **_gateway_env()}
+
+    resolved = cs.resolve_codex_runtime_auth(env=env)
+
+    assert resolved.model_provider == cs.CODEX_PROVIDER_NAME
+    assert resolved.cli_auth_source is None
+    assert _override_value(resolved.provider.overrides, "model_provider") == '"hyperloom"'
+
+
+def test_runtime_auth_rejects_cli_login_owned_by_another_user(tmp_path, monkeypatch):
+    env = _cli_auth_env(tmp_path)
+    effective_uid = os.geteuid()
+    monkeypatch.setattr(cs.os, "geteuid", lambda: effective_uid + 1)
+
+    with pytest.raises(cs.CodexSessionUnavailableError, match="owned by the current user"):
+        cs.resolve_codex_runtime_auth(env=env)
+
+
+# --------------------------------------------------------------------------- #
+# Sandbox and approval selection
 # --------------------------------------------------------------------------- #
 
 
@@ -851,6 +908,31 @@ def test_run_codex_turn_isolates_codex_home_under_the_runtime_dir(tmp_path, monk
     assert all(record["codex_home_exists_when_closed"] for record in records)
     assert not Path(homes[0]).exists()
     assert not Path(homes[1]).exists()
+
+
+def test_run_codex_turn_copies_cli_login_only_into_private_home(tmp_path, monkeypatch):
+    runtime_dir = tmp_path / "runtime"
+    env = _cli_auth_env(tmp_path)
+    env["HYPERLOOM_RUNTIME_DIR"] = str(runtime_dir)
+    record = _install_fake_sdk(monkeypatch)
+
+    result = asyncio.run(
+        cs.run_codex_turn(
+            prompt="p",
+            developer_instructions="i",
+            cwd=tmp_path,
+            model="m",
+            timeout_sec=5.0,
+            env=env,
+        )
+    )
+
+    assert result.text == "done"
+    assert record["cli_auth_exists_at_enter"] is True
+    assert record["cli_auth_mode_at_enter"] == 0o600
+    assert "model_provider" not in record["thread_options"]
+    assert (Path(env["CODEX_HOME"]) / "auth.json").is_file()
+    assert not Path(record["codex_home_at_enter"]).exists()
 
 
 def test_run_codex_turn_retries_busy_cleanup_and_repeated_late_writes(tmp_path, monkeypatch):

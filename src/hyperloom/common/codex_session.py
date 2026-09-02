@@ -1,7 +1,38 @@
 # SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""Codex Agent SDK sessions for Hyperloom's OpenAI-side runners."""
+"""Codex Agent SDK sessions for Hyperloom's OpenAI-side runners.
+
+Hyperloom never issues bare LLM API calls: every interaction runs inside an
+agent runtime. This module is the Codex half of that contract. It wraps
+``openai_codex`` so callers inherit the SDK's shell/file tools, sandbox, turn
+management and usage accounting instead of hand-rolling a tool-calling loop.
+:class:`CodexSession` holds one runtime open across many turns for a
+persistent role; :func:`run_codex_turn` is the one-shot form for a caller
+whose work is a single turn.
+
+The SDK plumbing follows ``kernelforge.agent_backends.codex.CodexBackend``,
+but that class cannot be reused: its workspace guard requires the session cwd
+to be a git worktree and enforces KernelForge's benchmark-file protection.
+Hyperloom's Codex sessions run against plain output directories, so only the
+patterns are shared.
+
+Codex's ``read-only`` and ``workspace-write`` presets rely on bubblewrap.
+Hyperloom defaults to ``workspace-write`` and performs a real bubblewrap
+capability probe before starting the SDK, so a binary that exists but cannot
+create the required namespace fails closed. ``bypass`` is available only when
+the operator selects it with :data:`CODEX_SANDBOX_MODE_ENV` *and* confirms that
+an external sandbox is already enforcing isolation with
+:data:`CODEX_EXTERNAL_SANDBOX_ENV`.
+
+Gateway credentials and headers remain environment-backed. Config overrides
+contain variable names only, because the SDK forwards every override through
+the app-server command line. An explicitly selected Codex CLI ChatGPT login is
+copied into the same per-run private ``CODEX_HOME`` instead; an ambient login
+is never selected implicitly. Cleanup waits briefly for late helper writers,
+retries transient busy errors, and fails explicitly rather than silently
+leaking state.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +43,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -40,6 +72,8 @@ _PRIVATE_HEADER_ENV_PREFIX = "HYPERLOOM_CODEX_HTTP_HEADER_"
 
 # Sandbox preset selector.
 CODEX_SANDBOX_MODE_ENV = "HYPERLOOM_CODEX_SANDBOX_MODE"
+CODEX_EXTERNAL_SANDBOX_ENV = "HYPERLOOM_CODEX_EXTERNAL_SANDBOX"
+CODEX_CLI_AUTH_ENV = "HYPERLOOM_CODEX_CLI_AUTH"
 DEFAULT_CODEX_SANDBOX_MODE = "workspace-write"
 # Ordered so the error raised for an unknown mode lists them predictably.
 CODEX_SANDBOX_MODES: tuple[str, ...] = ("bypass", "workspace-write", "read-only")
@@ -62,6 +96,20 @@ _CODEX_HOME_CLEANUP_SETTLE_SEC = 0.05
 _CODEX_HOME_CLEANUP_INITIAL_BACKOFF_SEC = 0.02
 _CODEX_HOME_CLEANUP_MAX_BACKOFF_SEC = 0.2
 _CODEX_HOME_TRANSIENT_ERRNOS = frozenset({errno.ENOTEMPTY, errno.EBUSY})
+_CODEX_AUTH_MAX_BYTES = 1024 * 1024
+
+# Any one of these means the operator intentionally configured an API/gateway
+# transport.  That transport always wins over the opt-in ChatGPT CLI session.
+_CODEX_GATEWAY_SIGNAL_KEYS: tuple[str, ...] = (
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_CUSTOM_HEADERS",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "LLM_GATEWAY_KEY",
+)
 
 
 class CodexSessionError(RuntimeError):
@@ -105,12 +153,161 @@ class CodexProviderConfig:
     env_additions: tuple[tuple[str, str], ...] = field(default=(), repr=False)
 
 
+@dataclass(frozen=True)
+class CodexRuntimeAuth:
+    """Resolved Codex authentication without embedding secrets in argv.
+
+    Gateway deployments carry provider overrides and child-only environment
+    additions.  An explicitly selected local ChatGPT login instead carries the
+    path to the operator's ``auth.json``; callers copy it into their private
+    ``CODEX_HOME`` and remove that private copy at teardown.
+    """
+
+    provider: CodexProviderConfig
+    model_provider: str | None
+    cli_auth_source: Path | None = field(default=None, repr=False)
+
+
 def _effective_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
     """Overlay caller values on the process environment exactly once."""
     effective = os.environ.copy()
     if env is not None:
         effective.update(env)
     return effective
+
+
+def codex_cli_auth_requested(env: Mapping[str, str] | None = None) -> bool:
+    """Return whether the operator explicitly selected the local Codex login."""
+    source = env if env is not None else os.environ
+    return (source.get(CODEX_CLI_AUTH_ENV) or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _codex_cli_auth_path(source: Mapping[str, str]) -> Path:
+    """Resolve and validate the operator Codex CLI credential file.
+
+    Only metadata and the JSON shape are inspected.  Credential values are
+    never returned or placed in an exception.
+    """
+    configured_home = (source.get("CODEX_HOME") or "").strip()
+    codex_home = Path(configured_home).expanduser() if configured_home else Path.home() / ".codex"
+    auth_path = codex_home / "auth.json"
+    try:
+        info = auth_path.lstat()
+    except OSError as exc:
+        raise CodexSessionUnavailableError(
+            f"{CODEX_CLI_AUTH_ENV}=1 but no Codex CLI login was found; run `codex login` first"
+        ) from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise CodexSessionUnavailableError("Codex CLI auth.json must be a regular file, not a symlink")
+    if info.st_uid != os.geteuid():
+        raise CodexSessionUnavailableError("Codex CLI auth.json must be owned by the current user")
+    if info.st_size <= 0 or info.st_size > _CODEX_AUTH_MAX_BYTES:
+        raise CodexSessionUnavailableError("Codex CLI auth.json has an invalid size")
+    if info.st_mode & 0o077:
+        raise CodexSessionUnavailableError("Codex CLI auth.json must not be accessible by group or other users")
+    try:
+        payload = json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise CodexSessionUnavailableError("Codex CLI auth.json is not readable valid JSON") from exc
+    tokens = payload.get("tokens") if isinstance(payload, dict) else None
+    if not isinstance(tokens, dict) or not any(tokens.get(name) for name in ("access_token", "refresh_token")):
+        raise CodexSessionUnavailableError("Codex CLI auth.json does not contain a ChatGPT login")
+    return auth_path.resolve(strict=True)
+
+
+def codex_cli_auth_available(env: Mapping[str, str] | None = None) -> bool:
+    """Return whether the opted-in local Codex login is usable."""
+    source = _effective_env(env)
+    if not codex_cli_auth_requested(source):
+        return False
+    try:
+        _codex_cli_auth_path(source)
+    except CodexSessionUnavailableError:
+        return False
+    return True
+
+
+def _gateway_configuration_present(source: Mapping[str, str]) -> bool:
+    """Return whether any explicit API/gateway setting is present."""
+    return any((source.get(name) or "").strip() for name in _CODEX_GATEWAY_SIGNAL_KEYS)
+
+
+def resolve_codex_runtime_auth(
+    *,
+    api_key_env: str = "OPENAI_API_KEY",
+    base_url_env: str = "OPENAI_BASE_URL",
+    env: Mapping[str, str] | None = None,
+) -> CodexRuntimeAuth:
+    """Resolve gateway auth or the explicitly selected Codex CLI login.
+
+    An explicit gateway signal always retains the historical provider mapping
+    and validation.  ChatGPT subscription auth is considered only when the
+    operator opted in with :data:`CODEX_CLI_AUTH_ENV` and no gateway setting is
+    present, preventing an ambient login from silently changing billing.
+    """
+    source = _effective_env(env)
+    if not _gateway_configuration_present(source) and codex_cli_auth_requested(source):
+        return CodexRuntimeAuth(
+            provider=CodexProviderConfig(overrides=()),
+            model_provider=None,
+            cli_auth_source=_codex_cli_auth_path(source),
+        )
+    provider = _resolve_codex_provider_config(
+        api_key_env=api_key_env,
+        base_url_env=base_url_env,
+        source=source,
+    )
+    return CodexRuntimeAuth(
+        provider=provider,
+        model_provider=CODEX_PROVIDER_NAME,
+    )
+
+
+def seed_codex_cli_auth(source: Path | None, codex_home: Path) -> Path | None:
+    """Securely copy a selected CLI login into a private ``CODEX_HOME``.
+
+    Returns the private file path so a long-lived caller can remove it as soon
+    as the child process exits.  ``None`` is a no-op for gateway auth.
+    """
+    if source is None:
+        return None
+    destination = Path(codex_home) / "auth.json"
+    source_fd = -1
+    destination_fd = -1
+    try:
+        source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        source_info = os.fstat(source_fd)
+        if not stat.S_ISREG(source_info.st_mode) or source_info.st_size > _CODEX_AUTH_MAX_BYTES:
+            raise CodexSessionUnavailableError("Codex CLI auth.json changed while preparing the private session")
+        destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        copied = 0
+        while True:
+            chunk = os.read(source_fd, 64 * 1024)
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > _CODEX_AUTH_MAX_BYTES:
+                raise CodexSessionUnavailableError("Codex CLI auth.json exceeds the private-session size limit")
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                view = view[written:]
+        os.fchmod(destination_fd, 0o600)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            destination.unlink()
+        raise
+    finally:
+        if destination_fd >= 0:
+            os.close(destination_fd)
+        if source_fd >= 0:
+            os.close(source_fd)
+    return destination
 
 
 def load_codex_sdk() -> Any:
@@ -573,6 +770,7 @@ def _private_codex_home(
     cwd: Path,
     writable_roots: Sequence[Path],
     source: Mapping[str, str],
+    cli_auth_source: Path | None = None,
 ) -> Iterator[Path]:
     """Create and deterministically clean one private mode-0700 state directory."""
     parent = _codex_home_parent(cwd=cwd, writable_roots=writable_roots, source=source)
@@ -583,6 +781,10 @@ def _private_codex_home(
     codex_home = Path(temporary.name)
     try:
         codex_home.chmod(0o700)
+        seed_codex_cli_auth(cli_auth_source, codex_home)
+    except CodexSessionUnavailableError:
+        temporary.cleanup()
+        raise
     except OSError as exc:
         temporary.cleanup()
         raise CodexSessionUnavailableError(f"cannot secure private CODEX_HOME {codex_home}: {exc}") from exc
@@ -681,6 +883,7 @@ class CodexSession:
         self._client: Any = None
         self._thread: Any = None
         self._thread_id: str = ""
+        self._model_provider: str | None = None
 
     @property
     def thread_id(self) -> str:
@@ -723,10 +926,10 @@ class CodexSession:
                 "but the capability probe failed; refusing to fall back to bypass"
             )
 
-        provider_config = _resolve_codex_provider_config(
+        runtime_auth = resolve_codex_runtime_auth(
             api_key_env=self.api_key_env,
             base_url_env=self.base_url_env,
-            source=effective_env,
+            env=effective_env,
         )
         sdk = load_codex_sdk()
         sandbox = codex_sandbox(
@@ -736,7 +939,7 @@ class CodexSession:
         )
         config_overrides = (
             "features.memories=false",
-            *provider_config.overrides,
+            *runtime_auth.provider.overrides,
             *_writable_root_overrides(self.writable_roots),
         )
         # The client is entered inside the CODEX_HOME context so unwinding closes the client first and only then
@@ -748,10 +951,11 @@ class CodexSession:
                     cwd=self.cwd,
                     writable_roots=self.writable_roots,
                     source=effective_env,
+                    cli_auth_source=runtime_auth.cli_auth_source,
                 )
             )
             child_env = effective_env.copy()
-            child_env.update(provider_config.env_additions)
+            child_env.update(runtime_auth.provider.env_additions)
             child_env["CODEX_HOME"] = str(codex_home)
             config = sdk.CodexConfig(
                 codex_bin=self.codex_bin or None,
@@ -772,6 +976,7 @@ class CodexSession:
         self._sdk = sdk
         self._sandbox = sandbox
         self._client = client
+        self._model_provider = runtime_auth.model_provider
 
     def reset_thread(self) -> None:
         """Drop the open conversation; the next turn opens a fresh thread."""
@@ -784,6 +989,7 @@ class CodexSession:
         self._sdk = None
         self._sandbox = None
         self._client = None
+        self._model_provider = None
         self.reset_thread()
         if stack is not None:
             await stack.aclose()
@@ -793,14 +999,16 @@ class CodexSession:
         if self._client is None or self._sdk is None:
             raise CodexSessionError("Codex session is not started; call start() first")
         if self._thread is None:
-            self._thread = await self._client.thread_start(
+            options: dict[str, Any] = dict(
                 approval_mode=self._sdk.ApprovalMode.deny_all,
                 cwd=str(self.cwd),
                 developer_instructions=self.developer_instructions,
                 model=self.model,
-                model_provider=CODEX_PROVIDER_NAME,
                 sandbox=self._sandbox,
             )
+            if self._model_provider:
+                options["model_provider"] = self._model_provider
+            self._thread = await self._client.thread_start(**options)
             self._thread_id = str(getattr(self._thread, "id", "") or "")
         return self._thread
 
@@ -902,11 +1110,14 @@ async def run_codex_turn(
 
 
 __all__ = [
+    "CODEX_CLI_AUTH_ENV",
+    "CODEX_EXTERNAL_SANDBOX_ENV",
     "CODEX_PROVIDER_NAME",
     "CODEX_SANDBOX_MODES",
     "CODEX_SANDBOX_MODE_ENV",
     "CodexHomeCleanupError",
     "CodexProviderConfig",
+    "CodexRuntimeAuth",
     "CodexSession",
     "CodexSessionError",
     "CodexSessionResult",
@@ -915,6 +1126,8 @@ __all__ = [
     "DEFAULT_CODEX_SANDBOX_MODE",
     "HYPERLOOM_RUNTIME_DIR_ENV",
     "api_key_env_name",
+    "codex_cli_auth_available",
+    "codex_cli_auth_requested",
     "codex_provider_overrides",
     "codex_sandbox",
     "load_codex_sdk",
@@ -922,6 +1135,8 @@ __all__ = [
     "normalize_codex_usage",
     "probe_codex_sandbox_capability",
     "resolve_codex_provider_config",
+    "resolve_codex_runtime_auth",
     "resolve_codex_sandbox_mode",
     "run_codex_turn",
+    "seed_codex_cli_auth",
 ]
