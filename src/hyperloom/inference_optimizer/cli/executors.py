@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
+from hyperloom.common.codex_session import codex_cli_auth_requested
 from hyperloom.orchestrator.actions.executors import (
     TargetAnalysisExecutor,
     baseline_executor,
@@ -98,6 +99,16 @@ def _build_specialist_executor(
     max_turns = int(getattr(args, "specialist_max_turns", DEFAULT_SPECIALIST_MAX_TURNS) or DEFAULT_SPECIALIST_MAX_TURNS)
     per_turn_max_seconds = float(getattr(args, "specialist_per_turn_max_seconds", 600.0) or 600.0)
     dispatch_mode = str(getattr(args, "specialist_dispatch_mode", "subprocess") or "subprocess").strip().lower()
+    if codex_cli_auth_requested() and dispatch_mode == "subprocess":
+        # The SDK path copies the ChatGPT credential into a private, ephemeral
+        # CODEX_HOME.  The CLI subprocess path intentionally owns a persistent
+        # task-local home and accepts gateway credentials only; placing a
+        # subscription token there would leave it behind in session artifacts.
+        log.warning(
+            "--codex-cli-auth selects in-process Codex specialists so the copied "
+            "ChatGPT credential is removed at SDK teardown"
+        )
+        dispatch_mode = "inprocess"
 
     framework_source_roots = tuple(resolve_kernel_search_roots())
     # Resolve the agent CLI once here so the backend, its executable and its

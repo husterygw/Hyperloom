@@ -279,23 +279,25 @@ def write_lifecycle_files(
     pid: int,
     pgid: int,
     model: str,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     """Persist pid + meta for a lifecycle server (Hyperloom-compatible)."""
     import json as _json
 
     Path(pid_dir).mkdir(parents=True, exist_ok=True)
     lifecycle_pid_file(pid_dir, framework, port).write_text(f"{pid} {pgid}\n", encoding="utf-8")
+    meta = {
+        "pid": pid,
+        "pgid": pgid,
+        "framework": framework,
+        "port": port,
+        "model": model,
+        "base_url": f"http://127.0.0.1:{port}",
+    }
+    if metadata:
+        meta.update(metadata)
     lifecycle_meta_file(pid_dir, framework, port).write_text(
-        _json.dumps(
-            {
-                "pid": pid,
-                "pgid": pgid,
-                "framework": framework,
-                "port": port,
-                "model": model,
-                "base_url": f"http://127.0.0.1:{port}",
-            }
-        ),
+        _json.dumps(meta),
         encoding="utf-8",
     )
 

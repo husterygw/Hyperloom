@@ -192,6 +192,16 @@ def teardown_lifecycle_server(
     meta_file = base / f"{tag}.json"
     server_pid: int | None = None
     server_pgid: int | None = None
+    lifecycle_meta: dict[str, Any] = {}
+    try:
+        if meta_file.is_file():
+            import json
+
+            loaded = json.loads(meta_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                lifecycle_meta = loaded
+    except (OSError, ValueError):
+        pass
     try:
         if pid_file.exists():
             parts = pid_file.read_text(encoding="utf-8").split()
@@ -226,6 +236,25 @@ def teardown_lifecycle_server(
                 framework,
                 port,
             )
+    # A persistent vllm_cuda server keeps its physical GPU rows across the two
+    # lifecycle rounds. Release only the exact holder/task in the session's
+    # canonical coordinator DB; never trust an arbitrary path from metadata.
+    lease_holder = str(lifecycle_meta.get("gpu_lease_holder") or "")
+    lease_task = str(lifecycle_meta.get("gpu_lease_task") or "")
+    current_session = os.environ.get("INFERENCE_OPTIMIZER_CURRENT_SESSION_DIR", "").strip()
+    if lease_holder and lease_task and current_session:
+        db_path = Path(current_session).resolve() / "storage" / "coordinator.db"
+        try:
+            import sqlite3
+
+            with sqlite3.connect(db_path, timeout=10) as conn:
+                conn.execute(
+                    "DELETE FROM gpu_leases WHERE holder_id=? AND task_id=?",
+                    (lease_holder, lease_task),
+                )
+                conn.commit()
+        except (OSError, sqlite3.Error):
+            log.warning("server_lifecycle teardown could not release CUDA GPU lease", exc_info=True)
     for p in (pid_file, meta_file):
         try:
             p.unlink()

@@ -1604,6 +1604,7 @@ class BaselineExecutor:
         # Backend-aware interpreter: bypass uses a plain python3, magpie uses the Magpie-importable venv.
         from .benchmark_backend import resolve_benchmark_interpreter
 
+        self._benchmark_python_explicit = magpie_python is not None
         self.magpie_python = magpie_python or resolve_benchmark_interpreter()
         # None = resolve from $FRAMEWORK at call time; explicit fixture path wins.
         self.default_config_path = Path(default_config_path) if default_config_path else None
@@ -2171,6 +2172,15 @@ class BaselineExecutor:
 
     async def _run_retrying(self, ctx: RunnerContext, *, recorder: Any = None) -> dict[str, Any]:
         """Run the Magpie baseline, with a one-shot eval-failure fallback."""
+        if not self._benchmark_python_explicit:
+            # ``baseline_executor`` is a module-level singleton imported while
+            # the CLI is still parsing, before target selection publishes
+            # HYPERLOOM_BENCHMARK_BACKEND. Re-resolve here so a later CUDA
+            # target does not retain the Magpie/PATH interpreter captured at
+            # import time.
+            from .benchmark_backend import resolve_benchmark_interpreter
+
+            self.magpie_python = resolve_benchmark_interpreter()
         result = await self._run_pass(ctx, recorder=recorder, attempt_reason=RUN_INITIAL)
         params = ctx.task.params or {}
         # A failed required patch timeline means the donor is incompatible with the current tree.

@@ -264,6 +264,7 @@ class TestProfileWorkloadContext:
             "precision": "fp8",
             "model_path": "/models/new",
             "tp": 2,
+            "pp": 1,
             "conc": 128,
             "isl": 1024,
             "osl": 512,

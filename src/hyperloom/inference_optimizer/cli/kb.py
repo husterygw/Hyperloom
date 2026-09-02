@@ -303,7 +303,12 @@ def _bootstrap_recipe_kb(
         or Path(manifest.get("model_path", "") or "").name
         or "unknown_model"
     )
-    hw = state.gpu_type or manifest.get("gpu_type", "") or "unknown_gpu"
+    hw = (
+        state.gpu_type
+        or (state.target_id if state.target_id != "amd_auto" else "")
+        or manifest.get("gpu_type", "")
+        or "unknown_gpu"
+    )
     stack_fp = manifest.get("stack_fingerprint") or {}
     image_digest = manifest.get("image") or ""
     # Mirror version + image fingerprint onto SharedState for the CLOSE-time recipe write.
@@ -314,6 +319,10 @@ def _bootstrap_recipe_kb(
                 merged_meta[str(key)] = value
         if image_digest and image_digest != "unknown":
             merged_meta["image_digest"] = image_digest
+        hardware_sha = str((getattr(state, "hardware_fingerprint", {}) or {}).get("sha256") or "")
+        if hardware_sha:
+            merged_meta["hardware_fingerprint_sha256"] = hardware_sha
+            merged_meta["target_id"] = state.target_id
         if merged_meta:
             state.stack_fingerprint_meta = merged_meta
     extra_attrs = {

@@ -59,6 +59,49 @@ See `python -m hyperloom.inference_optimizer.cli optimize --help` for the full f
 [SKILL.md](SKILL.md) for the prompt-driven launch workflow used inside
 Cursor and Claw.
 
+## Experimental NVIDIA/vLLM target
+
+The `nvidia_rtx4090_8x_local` target is the config-only CUDA MVP for the
+validated local host: exactly eight RTX 4090 GPUs (compute capability 8.9),
+CUDA 13.0 at `/usr/local/cuda-13.0`, and vLLM `0.27.0rc1`. It fails closed on
+hardware, wheel, compiler, session-resume, or `TP*PP` drift. It does not enter
+the ROCm/Magpie/InferenceX/TraceLens/GEAK/Quark paths.
+
+```bash
+conda activate llm_sim
+codex login                       # one-time ChatGPT login, if not already done
+export HYPERLOOM_BENCHMARK_BACKEND=vllm_cuda
+bash src/hyperloom/inference_optimizer/assets/install.sh
+
+python -m hyperloom.inference_optimizer.cli optimize \
+    --target nvidia_rtx4090_8x_local \
+    --codex-cli-auth \
+    --model /path/to/model \
+    --framework vllm \
+    --tp 1 --pp 8 \
+    --isl 128 --osl 32 --conc 2 \
+    --max-hours 2
+```
+
+`--codex-cli-auth` explicitly reuses the current `codex login` session; no
+`OPENAI_API_KEY` or `OPENAI_BASE_URL` is required. Hyperloom validates the
+owner-only CLI credential file, copies it into a private per-agent home, and
+removes that copy when the agent exits. Explicit gateway credentials still take
+precedence. Codex sandboxing remains independent: the secure default requires a
+working bubblewrap capability probe. On a host that already supplies an
+external isolation boundary but blocks bubblewrap namespaces, use the documented
+double opt-in `HYPERLOOM_CODEX_SANDBOX_MODE=bypass` plus
+`HYPERLOOM_CODEX_EXTERNAL_SANDBOX=1`.
+
+The target supports baseline, config exploration, sweep, and report. Profile,
+source patching, kernel patching, quantization, warm replay, evaluation, and
+multi-node execution are disabled by target capabilities. Each benchmark emits
+an atomic `vllm_cuda_benchmark.json`, the compatibility
+`benchmark_report.json`, raw vLLM JSON/logs, a launch plan, total tok/s,
+per-GPU tok/s, and p50/p90/p99 latency metrics. GPU leases retain physical
+index, UUID, and NUMA identity, and cleanup only terminates the session-owned
+process group.
+
 ## Layout
 
 ```

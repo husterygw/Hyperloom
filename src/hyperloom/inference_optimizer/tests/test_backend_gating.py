@@ -65,7 +65,7 @@ def test_install_sh_gates_magpie_calls():
     assert "sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'" in text
     assert "tr -d '[:space:]'" not in text
     # ensure_magpie runs only for non-bypass (inside the first else…fi block).
-    gate_idx = text.index("HYPERLOOM_BENCHMARK_BACKEND_LC=")
+    gate_idx = text.index('if [ "$HYPERLOOM_BENCHMARK_BACKEND_LC" = "bypass" ]; then')
     else_idx = text.index("else", gate_idx)
     fi_idx = text.index("\nfi\n", gate_idx)
     magpie_idx = text.index("ensure_magpie\n", gate_idx)

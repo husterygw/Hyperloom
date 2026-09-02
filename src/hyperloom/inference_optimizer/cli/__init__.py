@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from hyperloom.common import llm_config
+from hyperloom.common.codex_session import CODEX_CLI_AUTH_ENV, codex_cli_auth_requested
 from hyperloom.common.llm_config import CLAUDE_OAUTH_TOKEN_ENV, parse_custom_headers
 from .executors import (
     _build_specialist_executor,
@@ -119,6 +120,7 @@ from hyperloom.common.workload_defaults import (
     DEFAULT_OSL,
     DEFAULT_CONC,
     DEFAULT_TP,
+    DEFAULT_PP,
     DEFAULT_EP,
     DEFAULT_PRECISION,
 )
@@ -318,10 +320,36 @@ def _build_orchestration_prompt(
     action_registry: Mapping[str, ActionMetadata] | None = None,
     benchmark_mode: str = "",
     agentx_corpus_shape: Mapping[str, Any] | None = None,
+    target_capabilities: Mapping[str, bool] | None = None,
 ) -> str:
-    """Compose the Orchestration system prompt from typed inputs (``--orch-prompt`` overrides)."""
+    """Compose the Orchestration system prompt from typed inputs (``--orch-prompt`` overrides).
+
+    Args:
+        no_kernel (bool): When ``True`` the kernel actions are disabled.
+        framework (str): The serving framework name (e.g. ``sglang``).
+        objective (Objective): The run objective summarised into the prompt.
+        max_minutes (int): The wall-clock budget in minutes.
+        no_framework_agent (bool): When ``True`` the FRAMEWORK_AGENT phase is disabled.
+        macro_cycle (int): Current macro-cycle counter; shown in the CYCLE DIRECTIVE section.
+        cycle_directive (str): LLM-authored focus text for this cycle; empty renders the default arc.
+        phase (str): Current pipeline phase; omits the prompt modules whose
+            behaviour that phase cannot reach. Empty renders every module.
+        transport (str): How the orchestration backend carries an intent; omits
+            the prompt modules describing a tool surface it does not mount.
+        action_registry (Mapping[str, ActionMetadata] | None): The action
+            catalogue to use; defaults to :data:`ACTION_CATALOGUE`.
+        target_capabilities: Execution-target capability map used to hide
+            unsupported actions from the advisory prompt surface.
+
+    Returns:
+        str: The composed Orchestration system prompt.
+    """
     registry = action_registry or ACTION_CATALOGUE
-    enabled = default_enabled_actions(no_kernel=no_kernel, no_optimize=no_framework_agent)
+    enabled = default_enabled_actions(
+        no_kernel=no_kernel,
+        no_optimize=no_framework_agent,
+        target_capabilities=target_capabilities,
+    )
     kind, value = _objective_summary_for_prompt(objective)
     return build_orchestration_prompt(
         action_registry=registry,
@@ -785,8 +813,14 @@ def _smoke_test_codex_model(
     openai_key = os.environ.get("OPENAI_API_KEY", "")
     catalog_ids = _probe_llm_catalog(base_url=openai_url, api_key=openai_key)
     if catalog_ids is None:
-        # WARN-only path: don't block startup just because the OpenAI catalog is unreachable (the Claude gate already
-        # validated reachability).
+        # WARN-only path: don't block startup just because the OpenAI catalog
+        # is unreachable (the Claude gate already validated reachability).
+        if codex_cli_auth_requested():
+            print(
+                "Preflight: Codex CLI ChatGPT auth selected; the gateway catalog "
+                "probe does not apply, so trusting the configured Codex model id."
+            )
+            return
         print(
             "Preflight: WARNING — OpenAI-side catalog unreachable; skipping "
             "--codex-model verification (CodexBackend may fail at first turn)."
@@ -1103,6 +1137,7 @@ def _resolve_workload_knobs(
         ("osl", DEFAULT_OSL),
         ("conc", DEFAULT_CONC),
         ("tp", DEFAULT_TP),
+        ("pp", DEFAULT_PP),
         ("ep", DEFAULT_EP),
     )
     for name, default in int_knobs:
@@ -1138,8 +1173,33 @@ def _export_workload_envs_for_optimize(
     ep_resolved: int,
     argv: list[str] | None = None,
 ) -> None:
-    """Project resolved workload knobs (TP/CONC/EP) into env for downstream Magpie YAMLs."""
+    """Project resolved workload knobs into env for downstream benchmark YAMLs.
+
+    After ``_resolve_workload_knobs`` the values on ``args`` are already the
+    authoritative resolution (flag > resume-state > default), so export them
+    unconditionally. This keeps SharedState, the manifest, and the materialized
+    YAML in agreement instead of the old gated export that only fired for
+    explicit flags / multi-node and left SharedState and the served value split
+    (issue #903).
+
+    Args:
+        args (argparse.Namespace): The parsed CLI namespace (reads ``conc``).
+        nodes_resolved (int): The resolved node count (unused; retained for the
+            call-site contract).
+        tp_resolved (int): The resolved tensor-parallel size to export as ``TP``.
+        ep_resolved (int): The resolved expert-parallel size to export as ``EP``.
+        argv (list[str] | None): Unused; retained for the call-site contract.
+    """
     os.environ["TP"] = str(max(1, int(tp_resolved or 1)))
+    if (
+        os.environ.get("HYPERLOOM_TARGET_RUNTIME", "").strip().lower() == "cuda"
+        or getattr(args, "pp", None) is not None
+    ):
+        os.environ["PP"] = str(max(1, int(getattr(args, "pp", DEFAULT_PP) or DEFAULT_PP)))
+    else:
+        # AMD's historical TP-only YAML stays byte-stable unless the operator
+        # explicitly opted into pipeline parallelism.
+        os.environ.pop("PP", None)
     os.environ["CONC"] = str(max(1, int(getattr(args, "conc", DEFAULT_CONC) or DEFAULT_CONC)))
     os.environ["EP"] = str(max(1, int(ep_resolved or 1)))
 
@@ -1435,10 +1495,66 @@ def _persist_preflight_failure_artifacts(
 
 
 async def _run_optimize(args: argparse.Namespace) -> int:
-    """Run the ``optimize`` subcommand end to end."""
+    """Run the ``optimize`` subcommand end to end.
+
+    Resolves topology arguments (nodes, TP/EP, GPUs per node), runs
+    preflight, and drives the optimization session to completion.
+
+    Args:
+        args: Parsed CLI arguments for the ``optimize`` subcommand.
+
+    Returns:
+        Process exit code (``0`` on success).
+    """
+    # Resolve the platform boundary before any AMD cleanup or preflight runs.
+    # A resume reads its persisted target early so a bare resume cannot fall
+    # back through the AMD default before state.json is loaded later.
+    from ..target_registry import (
+        TargetValidationError,
+        configure_target_environment,
+        resolve_target,
+        validate_nvidia_host,
+        validate_target_arguments,
+    )
+
+    persisted_target = ""
+    persisted_hardware: dict[str, Any] = {}
+    if getattr(args, "resume_from", None):
+        try:
+            _early_state = SharedState.load_or_init(Path(args.resume_from).expanduser().resolve())
+            persisted_target = str(getattr(_early_state, "target_id", "") or "")
+            persisted_hardware = dict(getattr(_early_state, "hardware_fingerprint", {}) or {})
+        except Exception:  # noqa: BLE001 - canonical resume validation reports malformed state later
+            pass
+    explicit_target = str(getattr(args, "target", None) or os.environ.get("HYPERLOOM_TARGET", "")).strip()
+    if persisted_target and explicit_target and explicit_target != persisted_target:
+        print(
+            f"ERROR: resume target conflict: session={persisted_target!r}, requested={explicit_target!r}. "
+            "Start a new session for a different target.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    try:
+        target = resolve_target(explicit_target or None, persisted=persisted_target)
+        validate_target_arguments(args, target)
+        hardware_fingerprint = validate_nvidia_host(target) if target.runtime == "cuda" else {}
+        if persisted_hardware and hardware_fingerprint:
+            if persisted_hardware.get("sha256") != hardware_fingerprint.get("sha256"):
+                raise TargetValidationError(
+                    "NVIDIA hardware fingerprint changed since session creation; start a new session"
+                )
+        configure_target_environment(target, fingerprint=hardware_fingerprint)
+    except TargetValidationError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+    args.target = target.target_id
+    args.hardware_fingerprint = hardware_fingerprint
+    print(f"Execution target : {target.target_id} ({target.runtime}, backend={target.benchmark_backend})")
+
     # Surface --nodes (CLI flag wins) before _preflight runs.
     nodes_resolved = max(1, int(args.nodes))
     tp_resolved = max(1, int(getattr(args, "tp", 1) or 1))
+    pp_resolved = max(1, int(getattr(args, "pp", 1) or 1))
     ep_resolved = max(1, int(getattr(args, "ep", 1) or 1))
     # Resolve gpus_per_node from the explicit CLI flag or the policy default.
     gpn_attr = getattr(args, "gpus_per_node", None)
@@ -1447,13 +1563,21 @@ async def _run_optimize(args: argparse.Namespace) -> int:
     else:
         gpus_per_node_resolved = 8
     total_gpus = nodes_resolved * gpus_per_node_resolved
+    world_size = tp_resolved * pp_resolved
+    if target.runtime == "cuda" and world_size > total_gpus:
+        print(
+            f"ERROR: TP*PP={tp_resolved}*{pp_resolved}={world_size} exceeds "
+            f"the {total_gpus} GPUs available to target {target.target_id}.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
 
     # Topology sanity gates — multi-node only (nodes>=2); fail fast vs a cryptic launcher crash mid-cold-start.
     if nodes_resolved >= 2:
         # Gate 1: total cluster GPUs (nodes*gpus_per_node) must hold the model's TP shards.
-        if total_gpus < tp_resolved:
+        if total_gpus < world_size:
             print(
-                f"ERROR: TP={tp_resolved} exceeds total GPU count "
+                f"ERROR: TP*PP={tp_resolved}*{pp_resolved}={world_size} exceeds total GPU count "
                 f"({nodes_resolved} nodes * {gpus_per_node_resolved} "
                 f"gpus_per_node = {total_gpus}). Either lower --tp, raise "
                 "--nodes, or use a larger --gpus-per-node pod "
@@ -1530,16 +1654,17 @@ async def _run_optimize(args: argparse.Namespace) -> int:
             if v:
                 os.environ[env_key] = v
 
-    # Stale aiter JIT lock sweep: killed runs leave locks that block subsequent starts (locks <5min preserved).
-    aiter_sweep = clean_stale_aiter_locks()
-    if aiter_sweep["dir"] and aiter_sweep["deleted"]:
-        print(
-            f"Stale aiter locks cleared: "
-            f"dir={aiter_sweep['dir']} "
-            f"deleted={aiter_sweep['deleted']} "
-            f"skipped_fresh={aiter_sweep['skipped_fresh']} "
-            f"errors={aiter_sweep['errors']}"
-        )
+    # Stale AITER locks are a ROCm concern; a CUDA target never touches them.
+    if target.runtime != "cuda":
+        aiter_sweep = clean_stale_aiter_locks()
+        if aiter_sweep["dir"] and aiter_sweep["deleted"]:
+            print(
+                f"Stale aiter locks cleared: "
+                f"dir={aiter_sweep['dir']} "
+                f"deleted={aiter_sweep['deleted']} "
+                f"skipped_fresh={aiter_sweep['skipped_fresh']} "
+                f"errors={aiter_sweep['errors']}"
+            )
 
     claude_follows_codex = _claude_model_should_follow_codex()
     if claude_follows_codex:
@@ -1622,6 +1747,12 @@ async def _run_optimize(args: argparse.Namespace) -> int:
             )
             sys.exit(2)
         state = SharedState.load_or_init(session_dir)
+        if state.target_id != target.target_id:
+            print(
+                f"ERROR: resume target mismatch: state={state.target_id!r}, active={target.target_id!r}",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
         _stale = agentx_state_is_stale(state)
         if _stale:
             print(
@@ -1672,6 +1803,7 @@ async def _run_optimize(args: argparse.Namespace) -> int:
         _resume_max_model_len = getattr(args, "max_model_len", None) or getattr(state, "max_model_len", 0) or 0
         for env_name, val in (
             ("TP", args.tp),
+            ("PP", args.pp),
             ("EP", args.ep),
             ("CONC", args.conc),
             ("ISL", args.isl),
@@ -1716,22 +1848,27 @@ async def _run_optimize(args: argparse.Namespace) -> int:
             gpu_type=os.environ.get("GPU_TYPE") or state.gpu_type,
         )
         _persist_operator_supplied_paths(state)
-        # The partition shape is part of the measurement contract, so it resumes on the same restore / apply / persist
-        # path as the paths above.
-        _restore_partition_shape_from_state(args, state)
-        state.compute_partition = _export_partition_shape(
-            declared_mode=getattr(args, "compute_partition_mode", None),
-            streams_per_partition=getattr(args, "streams_per_partition", None),
-            framework=state.framework or getattr(args, "framework", None),
-            gpu_type=os.environ.get("GPU_TYPE") or state.gpu_type,
-            # A resume must re-pass --nodes, so the persisted count is the one that says whether this session was ever
-            # multi-node.
-            nodes=max(int(getattr(args, "nodes", 1) or 1), int(getattr(state, "nodes", 1) or 1)),
-            model_path=state.model_path or str(getattr(args, "model", "") or ""),
-            precision=state.precision or getattr(args, "precision", None),
-            # Passed for the persisted model identity.
-            shared_state=state,
-        )
+        # The partition shape is part of the measurement contract, so it resumes
+        # on the same restore / apply / persist path as the paths above. The
+        # re-check is not ceremony: a card can be repartitioned while a session
+        # is stopped, and resuming into a different topology would compare
+        # candidates measured under one shape against a baseline from another.
+        if target.runtime != "cuda":
+            _restore_partition_shape_from_state(args, state)
+            state.compute_partition = _export_partition_shape(
+                declared_mode=getattr(args, "compute_partition_mode", None),
+                streams_per_partition=getattr(args, "streams_per_partition", None),
+                framework=state.framework or getattr(args, "framework", None),
+                gpu_type=os.environ.get("GPU_TYPE") or state.gpu_type,
+                # A resume must re-pass --nodes, so the persisted count is the one
+                # that says whether this session was ever multi-node.
+                nodes=max(int(getattr(args, "nodes", 1) or 1), int(getattr(state, "nodes", 1) or 1)),
+                model_path=state.model_path or str(getattr(args, "model", "") or ""),
+                precision=state.precision or getattr(args, "precision", None),
+                shared_state=state,
+            )
+        else:
+            state.compute_partition = {}
         if state.compute_partition.get("mode"):
             print(f"  re-exported partition shape: {state.compute_partition['mode']}")
         if state.framework_repo_path:
@@ -1903,48 +2040,41 @@ async def _run_optimize(args: argparse.Namespace) -> int:
         if framework == "atom":
             _apply_atom_auto_tighten(args)
 
-        # Resolve real target GPU: probe > --gpu-type hint; probe wins to catch wrong-host typos that corrupt KB.
-        user_specified = (args.gpu_type or os.environ.get("GPU_TYPE", "")).strip().lower()
-        if _should_remote_probe_gpu(args):
-            from ..multi_node._internal.gpu_probe import remote_autodetect_gpu_type
-
-            probed = remote_autodetect_gpu_type() or ""
-            if probed:
-                print(f"GPU probe       : {probed} (remote {(args.mn_backend or 'rayjob').lower()})")
-        else:
-            probed = _autodetect_gpu_type() or ""
-        gpu_type, gpu_warnings = _resolve_gpu_type(
-            user_specified=user_specified,
-            probed=probed,
-        )
-        for line in gpu_warnings:
-            print(line, file=sys.stderr)
-        if probed and not user_specified:
-            print(f"GPU type        : {gpu_type} (auto-detected)")
-        runner_gpu_type = _gpu_runner_type(gpu_type)
-        if gpu_type and runner_gpu_type != gpu_type:
-            print(
-                f"WARN: {gpu_type} uses {runner_gpu_type} as Magpie "
-                f"runner_type (same gfx942/CDNA3 arch; Magpie has no "
-                f"sglang_{gpu_type}.sh / vllm_{gpu_type}.sh yet)",
-                file=sys.stderr,
-            )
-        args.gpu_type = gpu_type or None
-        if runner_gpu_type:
-            os.environ["TARGET_GPU_TYPE"] = gpu_type
-            os.environ["GPU_TYPE"] = runner_gpu_type
-            print(f"GPU type        : {gpu_type}")
-            print(f"Magpie runner   : {runner_gpu_type} (will inject runner_type into Magpie YAML)")
-        else:
+        if target.runtime == "cuda":
+            gpu_type = ""
+            runner_gpu_type = ""
             os.environ.pop("TARGET_GPU_TYPE", None)
             os.environ.pop("GPU_TYPE", None)
             args.gpu_type = None
-            print("GPU type        : <unset> (Magpie will auto-detect)")
-        _require_custom_entrypoint(framework, gpu_type=runner_gpu_type or gpu_type)
+            print(f"GPU target      : {target.expected_gpu_count}x {target.expected_gpu_name}")
+        else:
+            # Resolve real AMD board: probe > --gpu-type hint.
+            user_specified = (args.gpu_type or os.environ.get("GPU_TYPE", "")).strip().lower()
+            if _should_remote_probe_gpu(args):
+                from ..multi_node._internal.gpu_probe import remote_autodetect_gpu_type
 
-        # Runs here, not in _preflight, because the question it asks -- will provenance be able to name the ISA? -- is
-        # unanswerable until args.gpu_type is final.
-        _check_gfx_arch_resolvable(args.gpu_type)
+                probed = remote_autodetect_gpu_type() or ""
+                if probed:
+                    print(f"GPU probe       : {probed} (remote {(args.mn_backend or 'rayjob').lower()})")
+            else:
+                probed = _autodetect_gpu_type() or ""
+            gpu_type, gpu_warnings = _resolve_gpu_type(user_specified=user_specified, probed=probed)
+            for line in gpu_warnings:
+                print(line, file=sys.stderr)
+            runner_gpu_type = _gpu_runner_type(gpu_type)
+            args.gpu_type = gpu_type or None
+            if runner_gpu_type:
+                os.environ["TARGET_GPU_TYPE"] = gpu_type
+                os.environ["GPU_TYPE"] = runner_gpu_type
+                print(f"GPU type        : {gpu_type}")
+                print(f"Magpie runner   : {runner_gpu_type}")
+            else:
+                os.environ.pop("TARGET_GPU_TYPE", None)
+                os.environ.pop("GPU_TYPE", None)
+                args.gpu_type = None
+                print("GPU type        : <unset> (Magpie will auto-detect)")
+            _require_custom_entrypoint(framework, gpu_type=runner_gpu_type or gpu_type)
+            _check_gfx_arch_resolvable(args.gpu_type)
 
         # Resolve workload knobs (flag > default; no resume state on a fresh launch) so ISL/OSL/CONC/TP/EP are
         # authoritative reals before MAX_MODEL_LEN auto-derivation and env projection (issue #903).
@@ -2030,18 +2160,25 @@ async def _run_optimize(args: argparse.Namespace) -> int:
             model=str(args.model) if args.model else "",
             launch_info_file=getattr(args, "launch_info_file", None),
         )
-        # Placed here, not at the top of _run_optimize, because everything it weighs is resolved by now and none of it
-        # was then: the framework (whether anything fans out), args.gpu_type (the CU fallback), and args.model, which
-        # --quantize rewrites to the exported checkpoint -- sizing partitions against the source model would weigh the
-        # wrong weights.
-        compute_partition = _export_partition_shape(
-            declared_mode=getattr(args, "compute_partition_mode", None),
-            streams_per_partition=getattr(args, "streams_per_partition", None),
-            framework=framework,
-            gpu_type=args.gpu_type,
-            nodes=nodes_resolved,
-            model_path=str(args.model or os.environ.get("MODEL_PATH") or ""),
-            precision=getattr(args, "precision", None),
+        # Placed here, not at the top of _run_optimize, because everything it
+        # weighs is resolved by now and none of it was then: the framework
+        # (whether anything fans out), args.gpu_type (the CU fallback), and
+        # args.model, which --quantize rewrites to the exported checkpoint --
+        # sizing partitions against the source model would weigh the wrong
+        # weights. Still before the seed, so the shape it returns is the one
+        # persisted rather than a lossy re-read from the environment.
+        compute_partition = (
+            {}
+            if target.runtime == "cuda"
+            else _export_partition_shape(
+                declared_mode=getattr(args, "compute_partition_mode", None),
+                streams_per_partition=getattr(args, "streams_per_partition", None),
+                framework=framework,
+                gpu_type=args.gpu_type,
+                nodes=nodes_resolved,
+                model_path=str(args.model or os.environ.get("MODEL_PATH") or ""),
+                precision=getattr(args, "precision", None),
+            )
         )
         state = _seed_shared_state(
             session_dir,
@@ -2261,6 +2398,7 @@ async def _run_optimize(args: argparse.Namespace) -> int:
             transport=_orch_transport,
             benchmark_mode=str(getattr(coordinator.shared_state, "benchmark_mode", "") or ""),
             agentx_corpus_shape=coordinator.shared_state.agentx_corpus_shape,
+            target_capabilities=coordinator.shared_state.target_capabilities,
         ),
         "critic": args.critic_prompt or _load_critic_prompt(),
     }
@@ -2280,6 +2418,7 @@ async def _run_optimize(args: argparse.Namespace) -> int:
         transport=_orch_transport,
         benchmark_mode=str(getattr(coordinator.shared_state, "benchmark_mode", "") or ""),
         agentx_corpus_shape=coordinator.shared_state.agentx_corpus_shape,
+        target_capabilities=coordinator.shared_state.target_capabilities,
     )
     # Build specialist executor only when research_lane capacity > 0 (0 degrades to LLM-direct grid).
     specialist_capacity = int(getattr(args, "research_lane_capacity", 1) or 0)
@@ -2391,6 +2530,94 @@ async def _run_optimize(args: argparse.Namespace) -> int:
         # exit anyway; this just frees it promptly for an intentional resume.
         with timed_teardown_step(state, "session_lock"):
             session_lock.release()
+        # Crash-safe reports/final.json. Runs unconditionally and first so a
+        # machine-readable summary always exists even when the CLOSE sequencer
+        # never ran. Idempotent: a no-op when ReportExecutor already wrote it.
+        try:
+            from ..breakdown import write_minimal_final_json
+
+            with timed_teardown_step(state, "final_json"):
+                final_json = write_minimal_final_json(session_dir)
+            print(f"Final summary     : {final_json}")
+        except Exception:  # noqa: BLE001 — safety net must never mask stop_reason
+            log.exception("crash-safe final.json write failed (non-fatal)")
+        # End-of-session safety net: always materialize session_breakdown.json (best-effort; never mask stop_reason).
+        # Skip when the CLOSE sequencer already wrote it (close_sequence_done is locked in CORE_STATE_FIELDS).
+        sequencer_done = getattr(state, "close_sequence_done", False)
+        if sequencer_done:
+            print(
+                "Session breakdown : (already written by CLOSE phase sequencer; skipping cli.finally safety-net write)"
+            )
+            # Re-run the Langfuse flush idempotently as a safety net.
+            try:
+                from hyperloom.orchestrator.trace.langfuse_emitter import (
+                    flush_session,
+                    record_session_breakdown,
+                )
+
+                with timed_teardown_step(state, "langfuse"):
+                    flush_session(session_dir)
+                    from ..breakdown import patch_breakdown_langfuse
+
+                    patch_breakdown_langfuse(session_dir)
+                    record_session_breakdown(session_dir)
+            except Exception:  # noqa: BLE001
+                log.debug("langfuse flush_session (post-sequencer) failed", exc_info=True)
+        else:
+            try:
+                from ..breakdown import write_breakdown_json
+
+                with timed_teardown_step(state, "session_breakdown"):
+                    breakdown_path = write_breakdown_json(session_dir)
+                print(f"Session breakdown : {breakdown_path}")
+            except Exception:  # noqa: BLE001
+                log.exception("session_breakdown finalize failed (non-fatal)")
+            # Safety-net reports/final.md write. Full sequencer reports are
+            # preserved; a prior emergency report is refreshed after resume.
+            try:
+                from ..breakdown import write_minimal_final_report
+
+                with timed_teardown_step(state, "final_md"):
+                    final_md = write_minimal_final_report(session_dir)
+                print(f"Final report      : {final_md}")
+            except Exception:  # noqa: BLE001
+                log.exception("emergency final report write failed (non-fatal)")
+            # Live Langfuse push (opt-in, default off): reconcile + flush, then
+            # splice the post-flush receipt into the session_breakdown.json
+            # langfuse section. Runs before the artifact package so the bundled
+            # SBD carries counts_final=true. No-op unless HYPERLOOM_LANGFUSE_ENABLE
+            # + LANGFUSE_* are set; idempotent.
+            try:
+                from hyperloom.orchestrator.trace.langfuse_emitter import (
+                    flush_session,
+                    record_session_breakdown,
+                )
+
+                with timed_teardown_step(state, "langfuse"):
+                    flush_session(session_dir)
+                    from ..breakdown import patch_breakdown_langfuse
+
+                    patch_breakdown_langfuse(session_dir)
+                    record_session_breakdown(session_dir)
+            except Exception:  # noqa: BLE001
+                log.debug("langfuse flush_session failed (non-fatal)", exc_info=True)
+
+        # Safety-net artifact package -> /workspace, for paths that leave
+        # close_sequence_done False and never run the sequencer. Best-effort;
+        # runs after the SBD/final.md + Langfuse flush so the freshest products
+        # are bundled.
+        try:
+            from ..breakdown import package_session_artifacts
+
+            with timed_teardown_step(state, "artifact_package"):
+                pkg_path = package_session_artifacts(
+                    session_dir,
+                    session_id=str(getattr(state, "session_id", "") or ""),
+                )
+            if pkg_path is not None:
+                print(f"Artifact package  : {pkg_path}")
+        except Exception:  # noqa: BLE001
+            log.exception("session artifact package failed (non-fatal)")
         _write_cli_terminal_artifacts(session_dir, state, effective_stop_reason)
         try:
             state.save(session_dir)
@@ -2429,6 +2656,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     # Strict on purpose.
     args = parser.parse_args(argv)
+    if args.command == "optimize":
+        if bool(getattr(args, "codex_cli_auth", False)):
+            os.environ[CODEX_CLI_AUTH_ENV] = "1"
+            # Provider selection happens before a Codex session opens.  Mark
+            # this explicit OpenAI-side choice so orchestration and specialist
+            # routing do not fall back to an unauthenticated Claude runtime.
+            os.environ["INFERENCE_OPTIMIZER_CLAUDE_FOLLOWS_CODEX"] = "1"
+        else:
+            os.environ.pop(CODEX_CLI_AUTH_ENV, None)
     level = logging.WARNING - 10 * min(args.verbose, 2)
     logging.basicConfig(
         level=level,

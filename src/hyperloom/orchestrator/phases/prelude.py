@@ -2510,6 +2510,13 @@ class PreludePhase(PhaseHandler):
     ) -> None:
         """Enqueue the PRELUDE-bootstrap roofline/profile task after baseline; skipped while warm-replay is in_flight (GPU/port contention)."""
         state = self.shared_state
+        capabilities = getattr(state, "target_capabilities", None)
+        if isinstance(capabilities, dict) and capabilities and not bool(capabilities.get("profile", False)):
+            log.info(
+                "PRELUDE: target=%s disables profile/roofline; baseline is the complete analysis prelude",
+                getattr(state, "target_id", "unknown"),
+            )
+            return
         if _phase_state.warm_replay_in_flight(state):
             log.info(
                 "PRELUDE: deferring initial %s until warm-replay completes",

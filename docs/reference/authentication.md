@@ -23,9 +23,10 @@ first — it does not survive a new shell.
 
 Hyperloom needs at most two classes of configuration:
 
-- **LLM gateway credentials**: At least one provider side, configured with both
-   its base URL and its own key (see
-   [LLM gateway credentials](#llm-gateway-credentials)).
+- **LLM credentials**: Either at least one gateway provider side, configured
+   with both its base URL and its own key, or an explicit
+   `--codex-cli-auth` opt-in to an existing `codex login` session (see
+   [Codex CLI ChatGPT authentication](#codex-cli-chatgpt-authentication)).
 - **Path / workspace layout**: Run bare-metal setup from the installed
    Hyperloom target directory. You normally only set `USER_DATA_PATH`
    (writable artifact root; defaults to `/workspace/hyperloom` when `/workspace`
@@ -69,12 +70,43 @@ If neither source supplies a usable LLM endpoint (at least one of
 `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` and at least one of
 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` /
 `DEEPSEEK_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`), the CLI fails fast at startup
-with a message naming the missing pieces.
+with a message naming the missing pieces. The explicit `--codex-cli-auth` mode
+is the exception: it validates an existing Codex CLI login instead of requiring
+an endpoint and API key.
 
 Preflight also rejects a *mispaired* configuration: a base URL whose only key
 belongs to the other provider, or a key whose only endpoint would come from the
 other provider. Hyperloom would otherwise send that key to a foreign host. Give
 each side its own `*_BASE_URL` and key, or drop the foreign key.
+
+---
+
+## Codex CLI ChatGPT authentication
+
+For a local Codex-driven run, first authenticate the installed CLI once, then
+opt in on each optimizer launch:
+
+```bash
+codex login
+python -m hyperloom.inference_optimizer.cli optimize \
+    --codex-cli-auth \
+    --target nvidia_rtx4090_8x_local \
+    --model /path/to/model \
+    --framework vllm
+```
+
+This mode needs neither `OPENAI_API_KEY` nor `OPENAI_BASE_URL`. It is explicit:
+an ambient login is ignored unless `--codex-cli-auth` or
+`HYPERLOOM_CODEX_CLI_AUTH=1` is set. If complete OpenAI gateway credentials are
+also present, the gateway wins so a stale CLI session cannot silently change
+the selected provider.
+
+Hyperloom validates the CLI `auth.json` before use: the path must be a regular,
+non-symlink file owned exclusively by the current user, limited to 1 MiB, and
+contain a usable ChatGPT token record. Each agent receives a mode-`0600` copy in
+a private temporary `CODEX_HOME`; the copy is removed at teardown. Sandbox
+selection is separate from authentication and is documented under
+[Codex CLI authentication and agent sandbox](environment-variables.md#codex-openai-cli-authentication-and-agent-sandbox).
 
 ---
 

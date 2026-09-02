@@ -24,6 +24,8 @@ def _clear_provider_env(monkeypatch) -> None:
         "DEEPSEEK_BASE_URL",
         "DEEPSEEK_API_KEY",
         "LLM_GATEWAY_KEY",
+        "HYPERLOOM_CODEX_CLI_AUTH",
+        "INFERENCE_OPTIMIZER_CLAUDE_FOLLOWS_CODEX",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -70,6 +72,14 @@ def test_build_backends_mock_defaults() -> None:
     assert b["critic"] == ("mock_critic",)
     assert b["robustness"] == ("mock_rob",)
     assert "kernel_agent" not in b
+
+
+def test_build_backends_cli_auth_uses_codex_orchestration(monkeypatch) -> None:
+    monkeypatch.setenv("HYPERLOOM_CODEX_CLI_AUTH", "1")
+
+    b = _build()
+
+    assert b["orchestration"][0] == "codex"
 
 
 def test_build_backends_invalid_critic_choice() -> None:

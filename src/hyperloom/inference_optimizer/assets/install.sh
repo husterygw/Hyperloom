@@ -798,11 +798,16 @@ PY
       # holding the old one. pip resolves `[llm,forge]` against the already
       # installed distribution -- verified to need no index for the top-level
       # package -- so this is a metadata read, not a reinstall.
-      # REPO_ROOT is the `pip install --target` dir, which is not on the default
-      # sys.path; without it pip misses the wheel and resolves it off the index.
-      env PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+      if [ "$HYPERLOOM_BENCHMARK_BACKEND_LC" = "vllm_cuda" ]; then
         "$PYTHON" -m pip install --quiet "${PIP_EXTRA[@]}" \
-        "hyperloom-inference_optimizer[llm,forge]"
+          "hyperloom-inference_optimizer[nvidia]"
+      else
+        # REPO_ROOT is the `pip install --target` dir, which is not on the default
+        # sys.path; without it pip misses the wheel and resolves it off the index.
+        env PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+          "$PYTHON" -m pip install --quiet "${PIP_EXTRA[@]}" \
+          "hyperloom-inference_optimizer[llm,forge]"
+      fi
       # web extra only when critic web tools are enabled (off by default).
       if [ "${CRITIC_WEB_TOOLS_ENABLED:-}" = "true" ] || [ "${CRITIC_WEB_TOOLS_ENABLED:-}" = "1" ]; then
         "$PYTHON" -m pip install --quiet "${PIP_EXTRA[@]}" "markdownify>=0.11" "cachetools>=5.3"
@@ -814,12 +819,18 @@ PY
       warn "claude_agent_sdk not importable after runtime dep install (Coordinator will fail)"
       [ "$CHECK_ONLY" -eq 1 ] || die "claude_agent_sdk missing"
     fi
-    _check_kernelforge_ready
+    if [ "$HYPERLOOM_BENCHMARK_BACKEND_LC" != "vllm_cuda" ]; then
+      _check_kernelforge_ready
+    fi
     return 0
   fi
   log "ensuring inference_optimizer package + claude_agent_sdk extras"
   if [ "$CHECK_ONLY" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-    "$PYTHON" -m pip install --quiet "${PIP_EXTRA[@]}" -e "${REPO_ROOT}[test]"
+    if [ "$HYPERLOOM_BENCHMARK_BACKEND_LC" = "vllm_cuda" ]; then
+      "$PYTHON" -m pip install --quiet "${PIP_EXTRA[@]}" -e "${REPO_ROOT}[nvidia]"
+    else
+      "$PYTHON" -m pip install --quiet "${PIP_EXTRA[@]}" -e "${REPO_ROOT}[test]"
+    fi
   fi
   "$PYTHON" - <<'PY' || die "hyperloom.inference_optimizer not importable after install"
 import hyperloom.inference_optimizer  # noqa: F401
@@ -830,7 +841,9 @@ PY
     warn "claude_agent_sdk not importable after install (Coordinator will fail)"
     [ "$CHECK_ONLY" -eq 1 ] || die "claude_agent_sdk missing"
   fi
-  _check_kernelforge_ready
+  if [ "$HYPERLOOM_BENCHMARK_BACKEND_LC" != "vllm_cuda" ]; then
+    _check_kernelforge_ready
+  fi
 }
 
 # Readiness probe for the built-in kernel-opt agent. It replaces the step that
@@ -1012,6 +1025,10 @@ _ensure_pandas_lt3_for_rocpc() {
 }
 
 ensure_rocprof_compute() {
+  if [ "${HYPERLOOM_BENCHMARK_BACKEND_LC:-}" = "vllm_cuda" ]; then
+    log "rocprof-compute skipped for vllm_cuda target"
+    return 0
+  fi
   # UNCONDITIONAL, not gated on KERNEL_OPT_BACKEND_ORDER: install.sh runs at
   # setup time under the default geak backend — the carrier sets
   # KERNEL_OPT_BACKEND_ORDER=forge only later on the optimize command, AFTER
@@ -1775,6 +1792,10 @@ ensure_langfuse_when_enabled() {
 # time, which is why preflight owns the pass that covers the documented flow.
 # This one is the fast path for operators who export it before installing.
 ensure_framework_deps() {
+  if [ "${HYPERLOOM_BENCHMARK_BACKEND_LC:-}" = "vllm_cuda" ]; then
+    log "framework dependency hook skipped for pinned vllm_cuda wheel"
+    return 0
+  fi
   if [ -z "${FRAMEWORK:-}" ]; then
     log "framework deps: \$FRAMEWORK unset at install time; CLI preflight will handle it at launch"
     return 0
@@ -1796,6 +1817,10 @@ ensure_framework_deps() {
 
 # --- 5. Chain to kernel-agent ---
 chain_kernel_agent() {
+  if [ "${HYPERLOOM_BENCHMARK_BACKEND_LC:-}" = "vllm_cuda" ]; then
+    log "kernel-agent installer skipped for vllm_cuda target"
+    return 0
+  fi
   if [ "$SKIP_KERNEL_AGENT" -eq 1 ]; then
     log "skipping kernel-agent installer (--skip-kernel-agent)"
     return 0
@@ -1823,8 +1848,7 @@ chain_kernel_agent() {
   bash "$script" "${args[@]}"
 }
 
-# --- targeted entry point: aiperf only -------------------------------------
-# Both entry points acquire the checkout lock before the aiperf state lock.
+HYPERLOOM_BENCHMARK_BACKEND_LC="$(printf '%s' "${HYPERLOOM_BENCHMARK_BACKEND:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
 if [ "$ONLY_AIPERF" -eq 1 ]; then
   log "--only-aiperf: installing just the pinned AgentX client"
   acquire_install_lock
@@ -1832,9 +1856,10 @@ if [ "$ONLY_AIPERF" -eq 1 ]; then
   log "--only-aiperf: done"
   exit 0
 fi
-
 ensure_inference_optimizer
-ensure_forge_gemm_tune
+if [ "$HYPERLOOM_BENCHMARK_BACKEND_LC" != "vllm_cuda" ]; then
+  ensure_forge_gemm_tune
+fi
 ensure_langfuse_when_enabled
 # Hold the install lock for the whole mirror-mutating region (Magpie /
 # InferenceX clones + the chained kernel-agent GEAK/TraceLens clones).
@@ -1849,13 +1874,16 @@ acquire_install_lock
 # such as "by pass" stays != "bypass" and correctly falls through to Magpie
 # (runtime resolves such unknown values back to magpie). A blanket delete of
 # ALL whitespace would wrongly collapse "by pass" -> "bypass" and diverge.
-HYPERLOOM_BENCHMARK_BACKEND_LC="$(printf '%s' "${HYPERLOOM_BENCHMARK_BACKEND:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
 if [ "$HYPERLOOM_BENCHMARK_BACKEND_LC" = "bypass" ]; then
-  log "benchmark backend is bypass; skipping ensure_magpie + ensure_magpie_atomic_scripts_patch"
+  log "benchmark backend is $HYPERLOOM_BENCHMARK_BACKEND_LC; skipping Magpie"
+elif [ "$HYPERLOOM_BENCHMARK_BACKEND_LC" = "vllm_cuda" ]; then
+  log "benchmark backend is $HYPERLOOM_BENCHMARK_BACKEND_LC; skipping Magpie"
 else
   ensure_magpie
 fi
-ensure_inferencex
+if [ "$HYPERLOOM_BENCHMARK_BACKEND_LC" != "vllm_cuda" ]; then
+  ensure_inferencex
+fi
 # Ordering matters: the Magpie script patch also scrubs the redundant
 # `--concurrent-requests` eval flag from the InferenceX `benchmarks/` copies
 # Magpie actually executes, and teaches `benchmark_lib.sh::run_lm_eval` to
@@ -1863,31 +1891,18 @@ ensure_inferencex
 # — running the patch before it silently skipped those targets and left
 # RUN_EVAL=true baselines aborting on 'Unknown parameter'.
 if [ "$HYPERLOOM_BENCHMARK_BACKEND_LC" != "bypass" ]; then
-  ensure_magpie_atomic_scripts_patch
+  if [ "$HYPERLOOM_BENCHMARK_BACKEND_LC" != "vllm_cuda" ]; then
+    ensure_magpie_atomic_scripts_patch
+  fi
 fi
 
-# aiperf (AgentX client) installs whenever this build ships the AgentX assets.
-#
-# It used to be gated on INSTALL_AIPERF / HYPERLOOM_AGENTX being truthy HERE, in
-# the installer's process -- but those answer "is THIS RUN using AgentX", and the
-# question at provisioning time is "will this box ever be asked to". Nobody knows
-# that yet: the mode is chosen later, per session, by whoever dispatches the run.
-# Measured on the incident cluster: 11 of 13 provisioning runs logged
-# "aiperf (AgentX) skipped" and left a box that could not run AgentX at all.
-#
-# The presence of assets/agentx/ is the honest install-time signal -- a build
-# that ships the AgentX client is a build whose boxes may be asked to run it.
-#
-# Failure handling stays asymmetric, and deliberately so:
-#   * nobody asked  -> attempt it, but a failure only warns. This is a
-#     pre-warm, and an interpreter or network that cannot supply aiperf must not
-#     block a provision that was never going to use it.
-#   * asked by name -> AIPERF_REQUIRED=1, and a failure is FATAL (see
-#     ensure_aiperf). The caller named the dependency; leaving it absent with a
-#     warning in a log nobody reads is what produced the incident.
-# Either way the runtime preflight repairs a still-missing client and stops the
-# run if it cannot. Never for the bypass backend.
-if [ "$HYPERLOOM_BENCHMARK_BACKEND_LC" != "bypass" ]; then
+# aiperf (AgentX client) is an OPT-IN Magpie-path add-on: installed only when the
+# operator explicitly asks (INSTALL_AIPERF or HYPERLOOM_AGENTX truthy), so a
+# default install grows no extra network/build dependency. If AgentX is turned on
+# at runtime without aiperf present, the runtime preflight fails loud with
+# guidance (install it, or point AIPERF_BIN at an existing build). Fail-soft
+# inside ensure_aiperf. Never for the bypass backend.
+if [ "$HYPERLOOM_BENCHMARK_BACKEND_LC" != "bypass" ] && [ "$HYPERLOOM_BENCHMARK_BACKEND_LC" != "vllm_cuda" ]; then
   # Strip surrounding whitespace then lowercase, so the installer
   # parses these flags identically to the Python runtime's agentx_enabled()
   # (which .strip()s) — e.g. HYPERLOOM_AGENTX=" on " must be ON in both.
@@ -1915,8 +1930,10 @@ if [ "$HYPERLOOM_BENCHMARK_BACKEND_LC" != "bypass" ]; then
       fi ;;
   esac
 fi
-ensure_bench_serving_deps
-ensure_scriptable_quality_deps
+if [ "$HYPERLOOM_BENCHMARK_BACKEND_LC" != "vllm_cuda" ]; then
+  ensure_bench_serving_deps
+  ensure_scriptable_quality_deps
+fi
 ensure_framework_deps
 chain_kernel_agent
 # rocprof-compute + pandas<3 pin runs LAST — strictly AFTER every pip-installing

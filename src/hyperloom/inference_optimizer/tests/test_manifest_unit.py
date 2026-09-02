@@ -271,7 +271,8 @@ def test_build_manifest_with_args(monkeypatch):
 
 
 def test_build_manifest_shared_provenance_fields(monkeypatch):
-    """Schema v4 carries gfx/EP/graph-mode/server-args from the shared WP-0 provenance builder (kept in lockstep with the TraceShapeManifest)."""
+    """The current schema carries gfx/EP/graph-mode/server-args from the shared WP-0
+    provenance builder (kept in lockstep with the TraceShapeManifest)."""
     monkeypatch.setattr(mf, "_git_revision", lambda: "rev1")
     monkeypatch.setattr(mf, "_build_dependencies", lambda: {})
     monkeypatch.setattr(mf, "_detect_image", lambda: None)
@@ -287,7 +288,7 @@ def test_build_manifest_shared_provenance_fields(monkeypatch):
         },
     )
     m = mf.build_manifest(Path("/tmp/sd"))
-    assert m["schema_version"] == 4
+    assert m["schema_version"] == mf.SCHEMA_VERSION
     assert m["gfx_arch"] == "gfx950"
     assert m["ep"] == 8
     assert m["graph_mode"] == "graph_capture"

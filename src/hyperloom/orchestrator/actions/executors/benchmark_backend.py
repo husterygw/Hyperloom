@@ -12,7 +12,7 @@ from typing import Protocol
 # Backend selection env var.
 BENCHMARK_BACKEND_ENV = "HYPERLOOM_BENCHMARK_BACKEND"
 DEFAULT_BENCHMARK_BACKEND = "magpie"
-KNOWN_BENCHMARK_BACKENDS = frozenset({"magpie", "bypass"})
+KNOWN_BENCHMARK_BACKENDS = frozenset({"magpie", "bypass", "vllm_cuda"})
 
 
 class BenchmarkBackend(Protocol):
@@ -131,6 +131,60 @@ class BypassBackend:
         ]
 
 
+class VllmCudaBackend:
+    """Native NVIDIA runner using the vLLM CLI from this interpreter."""
+
+    name = "vllm_cuda"
+
+    def resolve_interpreter(self) -> str:
+        """Use the exact environment that imports the pinned vLLM wheel."""
+        import sys
+
+        return sys.executable
+
+    def lifecycle_eligibility(self, bench: dict) -> dict | None:
+        """Allow local, non-profiled vLLM server reuse."""
+        framework = str(bench.get("framework") or "").lower()
+        envs = bench.get("envs") or {}
+        try:
+            port = int(envs.get("PORT", 8888))
+        except (TypeError, ValueError):
+            port = 8888
+        verdict = {"eligible": False, "framework": framework, "port": port, "reason": ""}
+        from ._multi_node_env import is_multi_node
+
+        if is_multi_node():
+            verdict["reason"] = "multi-node (vllm_cuda MVP is local-only)"
+        elif framework != "vllm":
+            verdict["reason"] = f"framework {framework!r} is not vllm"
+        elif bool((bench.get("profiler") or {}).get("torch_profiler", {}).get("enabled")):
+            verdict["reason"] = "torch_profiler is outside the NVIDIA MVP"
+        else:
+            verdict["eligible"] = True
+        return verdict
+
+    def build_command(
+        self,
+        *,
+        python_exe: str,
+        config_path: Path,
+        output_dir: Path,
+    ) -> list[str]:
+        """Return the native vLLM CUDA runner argv."""
+        return [
+            python_exe,
+            "-m",
+            "hyperloom.orchestrator.actions.executors.vllm_cuda_runner",
+            "benchmark",
+            "--benchmark-config",
+            str(config_path),
+            "--output-dir",
+            str(output_dir),
+            "--run-mode",
+            "local",
+        ]
+
+
 def resolve_backend_name() -> str:
     """Resolve the active backend name from the environment."""
     raw = (os.environ.get(BENCHMARK_BACKEND_ENV) or "").strip().lower()
@@ -144,6 +198,8 @@ def resolve_backend() -> BenchmarkBackend:
     name = resolve_backend_name()
     if name == "bypass":
         return BypassBackend()
+    if name == "vllm_cuda":
+        return VllmCudaBackend()
     return MagpieBackend()
 
 

@@ -12,6 +12,7 @@ from hyperloom.orchestrator.actions.executors import _workload_envs as we
 # Env names that leak process state into the materialized YAML.
 _LEAKY_ENV = (
     "TP",
+    "PP",
     "EP",
     "ISL",
     "OSL",
@@ -20,6 +21,8 @@ _LEAKY_ENV = (
     "PRECISION",
     "RANDOM_RANGE_RATIO",
     "ROCR_VISIBLE_DEVICES",
+    "CUDA_VISIBLE_DEVICES",
+    "HYPERLOOM_TARGET_RUNTIME",
     "RUN_EVAL",
     "PROFILE",
     "MODEL_PATH",

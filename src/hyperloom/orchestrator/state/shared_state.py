@@ -344,8 +344,8 @@ _KEY_METRIC_MAP: dict[str, tuple[str, str]] = {
 }
 
 
-#: top-level state.json schema version, stamped on every save.
-LATEST_STATE_SCHEMA_VERSION: int = 6
+#: top-level state.json schema version; absent key treated as v1 and migrated to LATEST_STATE_SCHEMA_VERSION on first save.
+LATEST_STATE_SCHEMA_VERSION: int = 7
 
 
 def effective_closing_grace_sec(
@@ -445,8 +445,15 @@ class SharedState(_RenderMixin, _ExploreStateMixin):
     model_info: dict = field(default_factory=dict)
     framework: str = ""
     gpu_type: str = ""
+    # Execution target is independent of the AMD board identity above. Sessions
+    # predating v7 migrate to amd_auto.
+    target_id: str = "amd_auto"
+    target_capabilities: dict[str, bool] = field(default_factory=dict)
+    hardware_fingerprint: dict[str, Any] = field(default_factory=dict)
     # Workload metadata mirrored from manifest.json at session start; resume re-exports env vars.
     tp: int = 0
+    # Pipeline-parallel size. Actual serving world size is tp * pp.
+    pp: int = 1
     # Expert-parallel size for MoE; mirror of ``EP`` env var. Resume-safe.
     ep: int = 0
     precision: str = ""
@@ -930,6 +937,7 @@ class SharedState(_RenderMixin, _ExploreStateMixin):
         "precision",
         "model_path",
         "tp",
+        "pp",
         "conc",
         "isl",
         "osl",
@@ -972,7 +980,7 @@ class SharedState(_RenderMixin, _ExploreStateMixin):
                             exc_info=True,
                         )
             context[name] = normalized
-        for name in ("tp", "conc", "isl", "osl", "max_model_len"):
+        for name in ("tp", "pp", "conc", "isl", "osl", "max_model_len"):
             value = params.get(name)
             if value in (None, ""):
                 value = getattr(self, name, 0)
@@ -1196,6 +1204,12 @@ class SharedState(_RenderMixin, _ExploreStateMixin):
         if "elapsed_charged_sec" not in raw:
             started = to_unix(raw.get("start_ts"))
             filtered["elapsed_charged_sec"] = max(0.0, time.time() - started) if started else 0.0
+
+        if incoming_version < 7:
+            filtered.setdefault("target_id", "amd_auto")
+            filtered.setdefault("target_capabilities", {})
+            filtered.setdefault("hardware_fingerprint", {})
+            filtered.setdefault("pp", 1)
 
         if isinstance(filtered.get("enablement"), dict):
             filtered["enablement"] = EnablementRound.from_dict(filtered["enablement"])

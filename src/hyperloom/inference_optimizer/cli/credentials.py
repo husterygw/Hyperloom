@@ -12,6 +12,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+from hyperloom.common.codex_session import (
+    CodexSessionUnavailableError,
+    codex_cli_auth_requested,
+    resolve_codex_runtime_auth,
+)
 from hyperloom.common.llm_config import (
     ANTHROPIC_SYNTHESIZABLE_KEY_ENVS,
     CLAUDE_OAUTH_TOKEN_ENV,
@@ -338,6 +343,17 @@ def _validate_credentials() -> None:
     _warn_on_shadowed_oauth_token()
     _warn_on_oauth_against_a_foreign_endpoint()
     _warn_on_oauth_widened_provider_shape()
+    if codex_cli_auth_requested():
+        try:
+            runtime_auth = resolve_codex_runtime_auth()
+        except CodexSessionUnavailableError as exc:
+            print(f"\nERROR: Codex CLI authentication is not usable: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        # A gateway signal still wins and is validated by the normal path
+        # below.  With no gateway, the private ChatGPT login is the complete
+        # credential/endpoint pair and no API key should be synthesized.
+        if runtime_auth.cli_auth_source is not None:
+            return
     anthropic_url, openai_url = _resolve_llm_endpoints()
     has_anthropic_side = has_anthropic_credential()
     has_key = bool(os.environ.get("OPENAI_API_KEY") or has_anthropic_side)

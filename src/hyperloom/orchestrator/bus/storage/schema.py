@@ -99,6 +99,8 @@ _DDL = [
     """
     CREATE TABLE IF NOT EXISTS gpu_leases (
         gpu_id       INTEGER PRIMARY KEY,
+        gpu_uuid     TEXT,
+        numa_node    INTEGER,
         holder_id    TEXT    NOT NULL,
         task_id      TEXT    NOT NULL,
         acquired_at  TEXT    NOT NULL,
@@ -219,6 +221,15 @@ def ensure_schema(conn: sqlite3.Connection) -> int:
         cur.execute("BEGIN IMMEDIATE")
         for stmt in _DDL:
             cur.execute(stmt)
+        # v5 enriches physical CUDA leases without changing the integer PK
+        # used by AMD and Ray synthetic observation slots. SQLite has no
+        # ``ADD COLUMN IF NOT EXISTS``, so inspect first for idempotency.
+        cur.execute("PRAGMA table_info(gpu_leases)")
+        gpu_lease_columns = {str(row[1]) for row in cur.fetchall()}
+        if "gpu_uuid" not in gpu_lease_columns:
+            cur.execute("ALTER TABLE gpu_leases ADD COLUMN gpu_uuid TEXT")
+        if "numa_node" not in gpu_lease_columns:
+            cur.execute("ALTER TABLE gpu_leases ADD COLUMN numa_node INTEGER")
         _seed_default_lane_capacity(cur)
         cur.execute(
             "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (?, datetime('now'))",

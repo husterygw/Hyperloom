@@ -1195,9 +1195,9 @@ def materialize_config_with_envs(
     ``GPU_TYPE`` → ``runner_type`` + pinned generic ``{framework}_{gpu_type}.sh``
     (so Magpie doesn't fall through to a native script hardcoding
     ``--result-dir /workspace/``); ``benchmark_script`` (pre-sanitized) re-pins
-    after that; ``PRECISION`` → ``precision``; ``CONC/ISL/OSL/MAX_MODEL_LEN/TP/
-    RANDOM_RANGE_RATIO`` → ``benchmark.envs``; ``ROCR_VISIBLE_DEVICES``
-    reconciled against TP; ``RUN_EVAL`` defaulted; ``NUM_PROMPTS`` /
+    after that; ``PRECISION`` → ``precision``; ``CONC/ISL/OSL/MAX_MODEL_LEN/TP/PP/
+    RANDOM_RANGE_RATIO`` → ``benchmark.envs``; the target-specific visible
+    device mask is reconciled against ``TP*PP``; ``RUN_EVAL`` defaulted; ``NUM_PROMPTS`` /
     ``NUM_WARMUPS`` computed adaptively. ``inferencex_path`` explicitly pins
     ``benchmark.inferencex_path`` for one task (falling back to
     ``$INFERENCEX_PATH`` for existing callers). ``extra_server_args`` routes
@@ -1302,6 +1302,7 @@ def materialize_config_with_envs(
         "OSL",
         "MAX_MODEL_LEN",
         "TP",
+        "PP",
         "PORT",
     ):
         val = os.environ.get(env_key, "").strip()
@@ -1312,24 +1313,23 @@ def materialize_config_with_envs(
     r_env = os.environ.get("RANDOM_RANGE_RATIO", "").strip()
     if r_env:
         envs["RANDOM_RANGE_RATIO"] = float(r_env)
-    rocr_env = os.environ.get("ROCR_VISIBLE_DEVICES", "").strip()
-    if rocr_env:
-        envs["ROCR_VISIBLE_DEVICES"] = rocr_env
+    target_runtime = os.environ.get("HYPERLOOM_TARGET_RUNTIME", "rocm").strip().lower() or "rocm"
     tp_from_env = os.environ.get("TP", "").strip()
     tp_from_yaml = envs.get("TP")
-    rocr_yaml = str(envs.get("ROCR_VISIBLE_DEVICES") or "").strip()
-    rocr_devices = [d.strip() for d in rocr_yaml.split(",") if d.strip()]
     if tp_from_env:
         resolved_tp = int(tp_from_env)
-    elif rocr_yaml and not tp_from_yaml:
-        # Derive TP from the user-pinned GPU list when the YAML doesn't set TP.
-        resolved_tp = len(rocr_devices)
-        envs["TP"] = resolved_tp
     else:
         resolved_tp = int(tp_from_yaml or 1)
-    # Auto-clamp TP to the visible GPU count. Override via
+    pp_from_env = os.environ.get("PP", "").strip()
+    pp_from_yaml = envs.get("PP")
+    resolved_pp = int(pp_from_env or pp_from_yaml or 1)
+    resolved_tp = max(1, resolved_tp)
+    resolved_pp = max(1, resolved_pp)
+    world_size = resolved_tp * resolved_pp
+    # Auto-clamp is a compatibility behavior for the legacy TP-only path. CUDA
+    # topology is explicit and fails closed in the runner instead.
     # $INFERENCE_OPTIMIZER_DISABLE_TP_CLAMP=1.
-    if os.environ.get("INFERENCE_OPTIMIZER_DISABLE_TP_CLAMP", "").strip() != "1":
+    if target_runtime != "cuda" and os.environ.get("INFERENCE_OPTIMIZER_DISABLE_TP_CLAMP", "").strip() != "1":
         visible = _visible_gpu_count()
         if visible and resolved_tp > visible:
             log.warning(
@@ -1343,19 +1343,58 @@ def materialize_config_with_envs(
             )
             resolved_tp = visible
     envs["TP"] = resolved_tp
-    if not rocr_yaml or len(rocr_devices) < resolved_tp:
-        derived = ",".join(str(i) for i in range(resolved_tp))
-        if rocr_yaml and rocr_yaml != derived:
-            log.warning(
-                "ROCR_VISIBLE_DEVICES=%r has %d devices but TP=%d; "
-                "expanding to %r so SGLang sees enough GPUs. Set "
-                "ROCR_VISIBLE_DEVICES explicitly to override.",
-                rocr_yaml,
-                len(rocr_devices),
-                resolved_tp,
-                derived,
+    if target_runtime == "cuda" or pp_from_env or pp_from_yaml is not None:
+        envs["PP"] = resolved_pp
+    else:
+        # Preserve the byte-stable AMD materialization contract when pipeline
+        # parallelism was never part of the source workload.
+        envs.pop("PP", None)
+
+    if target_runtime == "cuda":
+        cuda_env = os.environ.get("CUDA_VISIBLE_DEVICES")
+        cuda_yaml = str(envs.get("CUDA_VISIBLE_DEVICES") or "").strip()
+        if cuda_env is not None:
+            cuda_yaml = cuda_env.strip()
+        cuda_devices = [d.strip() for d in cuda_yaml.split(",") if d.strip()]
+        if cuda_yaml and len(cuda_devices) < world_size:
+            raise ValueError(
+                f"CUDA_VISIBLE_DEVICES={cuda_yaml!r} exposes {len(cuda_devices)} devices "
+                f"but TP*PP={resolved_tp}*{resolved_pp}={world_size}"
             )
-        envs["ROCR_VISIBLE_DEVICES"] = derived
+        envs["CUDA_VISIBLE_DEVICES"] = cuda_yaml or ",".join(str(i) for i in range(world_size))
+        envs.pop("ROCR_VISIBLE_DEVICES", None)
+        envs.pop("HIP_VISIBLE_DEVICES", None)
+        bench.pop("runner_type", None)
+        bench.pop("benchmark_script", None)
+        bench.pop("inferencex_path", None)
+        envs["HYPERLOOM_TARGET_RUNTIME"] = "cuda"
+        envs["VLLM_PLUGINS"] = ""
+        cuda_home = os.environ.get("CUDA_HOME", "").strip()
+        if cuda_home:
+            envs["CUDA_HOME"] = cuda_home
+            envs["PATH"] = os.environ.get("PATH", "")
+    else:
+        rocr_env = os.environ.get("ROCR_VISIBLE_DEVICES", "").strip()
+        if rocr_env:
+            envs["ROCR_VISIBLE_DEVICES"] = rocr_env
+        rocr_yaml = str(envs.get("ROCR_VISIBLE_DEVICES") or "").strip()
+        rocr_devices = [d.strip() for d in rocr_yaml.split(",") if d.strip()]
+        if not tp_from_env and rocr_yaml and not tp_from_yaml:
+            resolved_tp = len(rocr_devices)
+            envs["TP"] = resolved_tp
+        if not rocr_yaml or len(rocr_devices) < resolved_tp:
+            derived = ",".join(str(i) for i in range(resolved_tp))
+            if rocr_yaml and rocr_yaml != derived:
+                log.warning(
+                    "ROCR_VISIBLE_DEVICES=%r has %d devices but TP=%d; "
+                    "expanding to %r so SGLang sees enough GPUs. Set "
+                    "ROCR_VISIBLE_DEVICES explicitly to override.",
+                    rocr_yaml,
+                    len(rocr_devices),
+                    resolved_tp,
+                    derived,
+                )
+            envs["ROCR_VISIBLE_DEVICES"] = derived
 
     # Last-resort fallbacks, resolved from the CLI workload defaults so the
     # recipe and the workload spec published beside it cannot disagree about what
@@ -1690,7 +1729,8 @@ def materialize_config_with_envs(
     #     every arm.
     # A scan of 60 production server logs found the flag set in none of them, so
     # this is not a hypothetical gap. setdefault keeps an operator override.
-    envs.setdefault("AITER_LOG_TUNED_CONFIG", "1")
+    if target_runtime != "cuda":
+        envs.setdefault("AITER_LOG_TUNED_CONFIG", "1")
     _sync_repo_aliases(
         bench,
         envs,
@@ -2003,8 +2043,21 @@ def materialize_config_with_envs(
                 restored,
                 bool(replace_args),
             )
-            # The seal applies the sink-side guard to whatever is left here.
-            envs[framework_env] = merge_server_args(profile_args, " ".join(restored))
+            merged = " ".join(restored)
+            if profile_args:
+                merged = merge_server_args(profile_args, merged)
+            # _finalize_framework_server_args already ran, so re-apply the sink-side
+            # guard it ends with rather than shipping an unvalidated string.
+            envs[framework_env] = validate_server_args_shell_safe(merged)
+    if target_runtime == "cuda":
+        # Reassert the platform boundary after candidate/reference env merges.
+        # A CUDA candidate cannot smuggle ROCm masks or re-enable a third-party
+        # vLLM platform plugin through ``extra_envs``.
+        envs.pop("ROCR_VISIBLE_DEVICES", None)
+        envs.pop("HIP_VISIBLE_DEVICES", None)
+        envs.pop("AITER_LOG_TUNED_CONFIG", None)
+        envs["VLLM_PLUGINS"] = ""
+        envs["HYPERLOOM_TARGET_RUNTIME"] = "cuda"
     # The rendered YAML is persisted, so credentials must not reach it.
     filtered_envs, dropped_credentials = filter_untrusted_env_mapping(
         envs,

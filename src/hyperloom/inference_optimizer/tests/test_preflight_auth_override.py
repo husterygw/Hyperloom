@@ -1804,6 +1804,20 @@ def test_smoke_test_codex_model_warns_on_probe_failure(monkeypatch, capsys):
     assert "unreachable" in out
 
 
+def test_smoke_test_codex_model_trusts_cli_login_without_gateway_warning(monkeypatch, capsys):
+    """ChatGPT CLI auth has no gateway catalog, but it is not an auth failure."""
+    monkeypatch.setenv("HYPERLOOM_CODEX_CLI_AUTH", "1")
+    monkeypatch.setattr(cli, "_probe_llm_catalog", lambda **kw: None)
+    args = _make_args(codex_model="gpt-5.4", critic_mock=False)
+
+    cli._smoke_test_codex_model(args, ("", ""), required=True)
+
+    out = capsys.readouterr().out
+    assert "ChatGPT auth selected" in out
+    assert "WARNING" not in out
+    assert "may fail at first turn" not in out
+
+
 def test_smoke_test_codex_model_skips_for_anthropic_only_fallback(monkeypatch, capsys):
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)

@@ -45,6 +45,8 @@ _PROVIDER_ENV_KEYS: tuple[str, ...] = (
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_CUSTOM_HEADERS",
+    "HYPERLOOM_CODEX_EXTERNAL_SANDBOX",
+    "HYPERLOOM_CODEX_CLI_AUTH",
     "HYPERLOOM_CODEX_SANDBOX_MODE",
 )
 
@@ -239,6 +241,7 @@ async def test_codex_home_is_per_task_and_outside_any_temp_dir(
         # Nothing configured keeps the historical default, so a deployment that authenticates the Claude CLI by other
         # means (a logged-in CLI, Bedrock) is untouched by this selection.
         ("unconfigured", {}, AGENT_BACKEND_CLAUDE),
+        ("codex_cli_auth", {"HYPERLOOM_CODEX_CLI_AUTH": "1"}, AGENT_BACKEND_CODEX),
     ],
 )
 def test_agent_backend_follows_the_credential_shape(

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from hyperloom.common import provenance
+from hyperloom.common.codex_session import codex_cli_auth_requested
 from hyperloom.common.env_safety import (
     filter_untrusted_env_mapping,
     is_allowed_dotenv_key,
@@ -104,7 +105,17 @@ def _resolve_dotenv_file() -> Path | None:
 
 
 def _provider_only_mode() -> str:
-    """Detect explicit single-provider intent from the current environment."""
+    """Detect explicit single-provider intent from the current environment.
+
+    Runs ahead of :func:`_normalize_legacy_deepseek_env`, so a retired
+    ``DEEPSEEK_*`` shell export is still read here and counts as Anthropic-side
+    intent. The Anthropic side is read through the credential registry so a
+    subscription-token host is recognised as Anthropic-only too — without it,
+    such a host gets no provider-only mode and therefore no protection against
+    a stale OpenAI side arriving from the kernel-agent env file.
+    """
+    if codex_cli_auth_requested():
+        return "codex_cli"
     has_anthropic = bool(
         os.environ.get("ANTHROPIC_BASE_URL")
         or has_anthropic_credential()
@@ -160,6 +171,8 @@ def _restore_provider_only_mode(provider_mode: str, snapshot: dict[str, str | No
         keys: tuple[str, ...] = _PROVIDER_FALLBACK_KEYS
     elif provider_mode == "openai":
         keys = _ANTHROPIC_FALLBACK_KEYS
+    elif provider_mode == "codex_cli":
+        keys = (*_PROVIDER_FALLBACK_KEYS, *_ANTHROPIC_FALLBACK_KEYS)
     else:
         return
     for key in keys:
@@ -347,7 +360,29 @@ def _correct_kernel_agent_path_vars(file_vars: dict[str, str], env_path: Path) -
 
 
 def _load_kernel_agent_env_fallback() -> dict[str, Any]:
-    """Auto-source the installer-written kernel-agent env file (``$KERNEL_AGENT_ENV`` or ``$USER_DATA_PATH/runtime/kernel-agent.env.sh``)."""
+    """Auto-source the installer-written kernel-agent env file
+    (``$KERNEL_AGENT_ENV`` or ``$USER_DATA_PATH/runtime/kernel-agent.env.sh``).
+
+    Must source before any orchestrator import (trace_analyze reads
+    HYPERLOOM_KERNEL_AGENT_ROOT at module load). When HYPERLOOM_KERNEL_AGENT_ROOT
+    is already set, bootstrapping is skipped but the env file is still consulted
+    to correct a stale/invalid inherited TRACELENS_ROOT. Hard-fail contract
+    (root unset only): sys.exit(2) if missing/0-vars/still-unset.
+    """
+    target_id = (os.environ.get("HYPERLOOM_TARGET") or "").strip()
+    if target_id:
+        try:
+            from ..target_registry import get_target
+
+            selected_target = get_target(target_id)
+        except (ImportError, ValueError):
+            selected_target = None
+        if selected_target is not None and not selected_target.capabilities.kernel_patch:
+            return {
+                "status": "skipped",
+                "skip_reason": "target_capability_disabled",
+                "detail": {"target_id": target_id, "vars_loaded": 0, "env_file": None},
+            }
     candidate = os.environ.get("KERNEL_AGENT_ENV")
     if not candidate:
         user_data = (os.environ.get("USER_DATA_PATH") or "").strip()
@@ -1003,6 +1038,32 @@ def _check_serving_framework(args, benchmark_python: str) -> dict[str, Any]:
         }
 
     interpreters = _framework_probe_interpreters(framework, benchmark_python)
+    if (os.environ.get("HYPERLOOM_TARGET_RUNTIME") or "").strip().lower() == "cuda":
+        found = next(
+            (
+                python_exe
+                for python_exe in interpreters
+                if _framework_importable(framework, python_exe).verdict is True
+            ),
+            None,
+        )
+        if found:
+            os.environ[RESOLVED_FRAMEWORK_PYTHON_ENV] = found
+            os.environ[RESOLVED_FRAMEWORK_ENV] = framework
+            print(f"Preflight: {framework} importable ({found}); CUDA target stack validated")
+            return {
+                "status": "applied",
+                "skip_reason": None,
+                "target": framework,
+                "detail": {"probe_interpreter": found, "runtime": "cuda", "cuda_verified": True},
+            }
+        probed = "\n".join(f"  - {python_exe}" for python_exe in interpreters)
+        print(
+            f"\nERROR: CUDA target requires {framework}, but it is not importable by:\n{probed}\n"
+            "Install the pinned NVIDIA target dependencies in this interpreter.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     found, probe = _resolve_framework_build(framework, interpreters)
     # Publish the interpreter this scan resolved to, so consumers that would otherwise re-derive it from
     # installer-written host state read the probed answer instead.
@@ -1510,12 +1571,20 @@ def _check_tracelens_root_exists() -> dict[str, Any]:
 
 
 def _check_node_claude_cli() -> None:
-    """WARN-only presence check for bundled agent CLIs (node/claude/codex)."""
-    missing = [t for t in ("node", "claude", "codex") if shutil.which(t) is None]
+    """WARN-only presence check for bundled agent CLIs (node/claude/codex).
+
+    SDKs fall back to direct HTTP when CLIs are absent, so this is informational.
+    """
+    # A ChatGPT-authenticated Codex run neither launches Claude nor needs the
+    # Node runtime. Reporting those tools as missing made a healthy
+    # ``--codex-cli-auth`` preflight look degraded.
+    tools = ("codex",) if codex_cli_auth_requested() else ("node", "claude", "codex")
+    missing = [tool for tool in tools if shutil.which(tool) is None]
     if missing:
+        backend = "CodexBackend" if codex_cli_auth_requested() else "ClaudeBackend / CodexBackend"
         print(
             f"Preflight: WARNING — CLI(s) not on PATH: {missing}. "
-            f"ClaudeBackend / CodexBackend may fall back to direct HTTP. "
+            f"{backend} may fall back to direct HTTP. "
             f"Run src/hyperloom/agents/kernel/scripts/install.sh to bring them in."
         )
 
@@ -1560,6 +1629,8 @@ def _emit_preflight_diagnostics(
     print(f"  warm_timeout        = {BASELINE_DEFAULT_TIMEOUT_SEC}s")
     if anthropic_base_url:
         print(f"  ANTHROPIC_BASE_URL  = {anthropic_base_url}")
+    elif codex_cli_auth_requested():
+        print("  ANTHROPIC_BASE_URL  = <unset> — not used (Codex CLI ChatGPT auth selected)")
     else:
         print("  ANTHROPIC_BASE_URL  = <unset> — no LLM base URL resolved; Claude SDK will fail")
     if args is not None:
@@ -2088,7 +2159,9 @@ def _preflight(
 
     benchmark_backend = _resolve_active_backend_name()
     _magpie_backend_active = benchmark_backend == "magpie"
-    # Interpreter used for benchmark-runtime installs (Ray).
+    _vllm_cuda_active = benchmark_backend == "vllm_cuda"
+    # Interpreter used for benchmark-runtime installs (Ray). For bypass this is
+    # sys.executable; for Magpie it's the Magpie-importable venv.
     benchmark_python = _resolve_benchmark_interpreter()
 
     # Outside a venv, add --break-system-packages so pip installs on bare-metal Debian/Ubuntu.
@@ -2167,45 +2240,92 @@ def _preflight(
         geak_url = os.environ.get("GEAK_BASE_URL", "").strip()
         if geak_cfg and geak_url and _sync_geak_config_base_url(geak_cfg, geak_url):
             print(f"Preflight: synced GEAK config base_url -> {geak_url} ({geak_cfg})")
+    elif codex_cli_auth_requested():
+        print("Preflight: Codex CLI ChatGPT authentication selected; no LLM base URL required")
     else:
         print("Preflight: WARNING — no LLM base URL set; Claude/Codex SDKs will fail at first call")
 
-    # --- ROCm env hygiene + GPU/shm sanity (defensive WARN-only) ---
-    _unset_hip_visible_devices()
-    _run_install_step(
-        install_event,
-        step_id="check_gpu_visibility",
-        category="check",
-        action=_check_gpu_visibility,
-    )
+    # --- Target-specific GPU hygiene + shared-memory sanity ---
+    if _vllm_cuda_active:
+        from ..target_registry import get_target, validate_nvidia_host
+
+        _run_install_step(
+            install_event,
+            step_id="check_gpu_visibility",
+            category="check",
+            action=lambda: validate_nvidia_host(get_target(getattr(args, "target", "") or "nvidia_rtx4090_8x_local")),
+        )
+    else:
+        _unset_hip_visible_devices()
+        _run_install_step(
+            install_event,
+            step_id="check_gpu_visibility",
+            category="check",
+            action=_check_gpu_visibility,
+        )
     _run_install_step(
         install_event,
         step_id="check_shm_disk",
         category="check",
         action=_check_shm_disk,
     )
-    _run_install_step(
-        install_event,
-        step_id="check_platform_tuning",
-        category="check",
-        action=_check_platform_tuning,
-    )
+    if _vllm_cuda_active:
+        _record_install_step(
+            install_event,
+            step_id="check_platform_tuning",
+            category="check",
+            status="skipped",
+            skip_reason="cuda_target",
+        )
+    else:
+        _run_install_step(
+            install_event,
+            step_id="check_platform_tuning",
+            category="check",
+            action=_check_platform_tuning,
+        )
 
-    # --- Runtime dep install --- 1.
-    _run_install_step(
-        install_event,
-        step_id="ensure_ray",
-        category="install",
-        action=lambda: _ensure_ray(benchmark_python, pip_extra),
-    )
+    # --- Runtime dep install ---
+    # 1. Ray — used broadly (multi-node scheduling, kernel/profile/recover
+    # executors), not only by Magpie, so it is installed regardless of backend.
+    # Install it with the active backend's interpreter so a bypass-only box
+    # gets Ray in its own venv instead of Magpie's.
+    if _vllm_cuda_active:
+        _record_install_step(
+            install_event,
+            step_id="ensure_ray",
+            category="install",
+            status="skipped",
+            skip_reason="single_node_config_only_target",
+        )
+    else:
+        _run_install_step(
+            install_event,
+            step_id="ensure_ray",
+            category="install",
+            action=lambda: _ensure_ray(benchmark_python, pip_extra),
+        )
 
-    # 1b.
-    _run_install_step(
-        install_event,
-        step_id="ensure_bench_serving_deps",
-        category="install",
-        action=lambda: _ensure_bench_serving_deps(benchmark_python, pip_extra),
-    )
+    # 1b. InferenceX benchmark_serving client deps — required by every serving
+    # benchmark client launch. install.sh installs these into the install-time
+    # $PYTHON, but the bypass runner launches the client with the active
+    # benchmark interpreter; ensure them there too so a bypass-only box whose
+    # sys.executable differs from /opt/venv can still import the client.
+    if _vllm_cuda_active:
+        _record_install_step(
+            install_event,
+            step_id="ensure_bench_serving_deps",
+            category="install",
+            status="skipped",
+            skip_reason="vllm_native_bench_client",
+        )
+    else:
+        _run_install_step(
+            install_event,
+            step_id="ensure_bench_serving_deps",
+            category="install",
+            action=lambda: _ensure_bench_serving_deps(benchmark_python, pip_extra),
+        )
 
     # 1c. lm_eval — GSM8K accuracy gate, multi-node only (the helper gates itself).
     _run_install_step(
@@ -2219,13 +2339,25 @@ def _preflight(
         ),
     )
 
-    # 1d.
-    _run_install_step(
-        install_event,
-        step_id="framework_deps",
-        category="install",
-        action=lambda: _ensure_framework_deps(args, benchmark_python, pip_extra),
-    )
+    # 1d. Per-framework runtime deps declared in assets/framework_deps/. This is
+    # the pass that covers the documented flow: install.sh runs before
+    # --framework is known, so its own attempt usually no-ops and a scriptable
+    # framework would otherwise reach baseline with nothing installed.
+    if _vllm_cuda_active:
+        _record_install_step(
+            install_event,
+            step_id="framework_deps",
+            category="install",
+            status="skipped",
+            skip_reason="pinned_vllm_wheel",
+        )
+    else:
+        _run_install_step(
+            install_event,
+            step_id="framework_deps",
+            category="install",
+            action=lambda: _ensure_framework_deps(args, benchmark_python, pip_extra),
+        )
 
     # 1e.
     _run_install_step(
@@ -2235,7 +2367,79 @@ def _preflight(
         action=lambda: _check_serving_framework(args, benchmark_python),
     )
 
-    # 2.
+    # The CUDA backend is self-contained in the installed vLLM wheel. It does
+    # not clone/patch Magpie or InferenceX and never checks TraceLens/ROCm.
+    if _vllm_cuda_active:
+        _record_install_step(
+            install_event,
+            step_id="ensure_magpie",
+            category="install",
+            status="skipped",
+            skip_reason="vllm_cuda_backend",
+            target="magpie-eval",
+        )
+        _record_install_step(
+            install_event,
+            step_id="clone_inferencex",
+            category="install",
+            status="skipped",
+            skip_reason="vllm_native_bench_client",
+            target="InferenceX",
+        )
+        _record_install_step(
+            install_event,
+            step_id="check_tracelens_cli",
+            category="check",
+            status="skipped",
+            skip_reason="target_capability_profile_false",
+            target="TraceLens",
+        )
+        _record_install_step(
+            install_event,
+            step_id="check_tracelens_root",
+            category="check",
+            status="skipped",
+            skip_reason="target_capability_profile_false",
+            target="TRACELENS_ROOT",
+        )
+        _check_node_claude_cli()
+        if args is not None:
+            _run_install_step(
+                install_event,
+                step_id="ir3_pr_monitor_probe",
+                category="degrade",
+                action=lambda: _run_ir3_preflight(args),
+            )
+        _run_install_step(
+            install_event,
+            step_id="diagnostics_snapshot",
+            category="diagnostic",
+            action=lambda: _emit_preflight_diagnostics(
+                magpie_python=benchmark_python,
+                anthropic_base_url=(resolved_urls[0] if resolved_urls is not None else None),
+                args=args,
+            ),
+        )
+        try:
+            _finish_install_event(
+                install_event,
+                args=args,
+                benchmark_backend=benchmark_backend,
+                benchmark_python=benchmark_python,
+                magpie_python=benchmark_python,
+                inferencex_path="",
+                resolved_urls=resolved_urls,
+            )
+        except Exception:  # noqa: BLE001 - diagnostics must not change startup
+            log.warning("failed to finalize CUDA install event", exc_info=True)
+        return resolved_urls
+
+    # 2. Magpie — the benchmark engine the Magpie backend shells out to.
+    # Skipped entirely when the
+    # active benchmark backend does not need Magpie (e.g. bypass): for the
+    # Magpie backend ``benchmark_python`` already resolves to the
+    # Magpie-importable venv (via resolve_benchmark_interpreter), so a
+    # bypass-only environment never resolves the Magpie venv / /opt/venv.
     magpie_python = benchmark_python
     magpie_installed = False
     magpie_spec: str | None = None

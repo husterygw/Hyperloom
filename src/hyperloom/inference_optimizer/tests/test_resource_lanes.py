@@ -48,7 +48,7 @@ def locks(conn):
 
 
 def test_schema_version_is_v5():
-    """v4 dropped ``tasks.allowed_tools``; v5 adds the bring-up round store."""
+    """v3 added the specialist GPU pool leases table; v4 drops ``tasks.allowed_tools``."""
     assert SCHEMA_VERSION == 5
 
 

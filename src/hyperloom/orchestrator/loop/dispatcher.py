@@ -1070,22 +1070,24 @@ class DispatcherCollaborator:
         return shape.tightened_to(self.shared_state.session_deadline())
 
     def _resolve_serving_tp(self) -> int:
-        """Resolve the live serving process's TP size (cards it holds).
+        """Resolve the live serving process's TP*PP size (cards it holds).
 
         Used for the serving-disjoint specialist pool (B1) and as the default
-        ``gpu_count`` for TP-coupled GPU specialists (B2). Prefers the
-        resume-safe ``shared_state.tp``; falls back to the ``TP`` env the CLI
-        exports before construction. Returns ``0`` when neither is set (the
-        legacy whole-pool / single-card behaviour).
+        ``gpu_count`` for topology-coupled GPU specialists (B2). Prefers the
+        resume-safe SharedState topology; falls back to the ``TP``/``PP`` envs
+        the CLI exports before construction. Returns ``0`` when TP is unset.
 
         Returns:
-            int: The serving TP size, or ``0`` when unknown.
+            int: The serving TP*PP world size, or ``0`` when unknown.
         """
         tp = int(getattr(self.shared_state, "tp", 0) or 0)
         if tp > 0:
-            return tp
+            return tp * max(1, int(getattr(self.shared_state, "pp", 1) or 1))
         try:
-            return max(0, int(os.environ.get("TP", "0") or 0))
+            return max(0, int(os.environ.get("TP", "0") or 0)) * max(
+                1,
+                int(os.environ.get("PP", "1") or 1),
+            )
         except ValueError:
             return 0
 

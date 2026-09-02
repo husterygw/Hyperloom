@@ -620,6 +620,7 @@ def extract_benchmark_measurement(
     latency = report.get("latency") or {}
     ttft = latency.get("ttft") or {}
     tpot = latency.get("tpot") or {}
+    itl = latency.get("itl") or {}
     e2el = latency.get("e2el") or {}
 
     measurement: dict[str, Any] = {
@@ -644,9 +645,19 @@ def extract_benchmark_measurement(
         ),
         "duration_seconds": to_float(throughput.get("duration_seconds")),
         "ttft_mean_ms": to_float(ttft.get("mean_ms")),
+        "ttft_p50_ms": first_float(ttft.get("p50_ms"), ttft.get("median_ms")),
+        "ttft_p90_ms": to_float(ttft.get("p90_ms")),
         "ttft_p99_ms": to_float(ttft.get("p99_ms")),
         "tpot_mean_ms": to_float(tpot.get("mean_ms")),
+        "tpot_p50_ms": first_float(tpot.get("p50_ms"), tpot.get("median_ms")),
+        "tpot_p90_ms": to_float(tpot.get("p90_ms")),
+        "itl_mean_ms": to_float(itl.get("mean_ms")),
+        "itl_p50_ms": first_float(itl.get("p50_ms"), itl.get("median_ms")),
+        "itl_p90_ms": to_float(itl.get("p90_ms")),
+        "itl_p99_ms": to_float(itl.get("p99_ms")),
         "e2el_mean_ms": to_float(e2el.get("mean_ms")),
+        "e2el_p50_ms": first_float(e2el.get("p50_ms"), e2el.get("median_ms")),
+        "e2el_p90_ms": to_float(e2el.get("p90_ms")),
         "e2el_p99_ms": to_float(e2el.get("p99_ms")),
         "raw_result_path": None,
         "nonfatal_warnings": [],

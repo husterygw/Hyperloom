@@ -40,6 +40,7 @@ from urllib.parse import urlsplit
 
 from hyperloom.common.codex_session import (
     CodexSessionError,
+    codex_cli_auth_requested,
     probe_codex_sandbox_capability,
     resolve_codex_provider_config,
     resolve_codex_sandbox_mode,
@@ -84,6 +85,41 @@ class SpecialistAgentUnavailableError(RuntimeError):
     run specialists at all. It surfaces as the task's failure rather than being
     absorbed into a fallback CLI that would fail to authenticate.
     """
+
+
+# The two agent CLIs that can drive the specialist contract (module docstring).
+AGENT_BACKEND_CLAUDE = "claude"
+AGENT_BACKEND_CODEX = "codex"
+
+
+def resolve_specialist_agent_backend(env: Mapping[str, str] | None = None) -> str:
+    """Return the agent CLI the deployment's credentials can actually drive.
+
+    An OpenAI-only deployment holds no Anthropic credential, so the Claude CLI
+    starts and immediately fails with ``Not logged in``; the Codex CLI is the
+    only runtime that can authenticate there. Every other shape — Anthropic-only,
+    both configured, or nothing configured (a CLI logged in by other means, or
+    Bedrock) — keeps the Claude CLI, so this only ever redirects the shape that
+    could not work at all.
+
+    The shape test itself belongs to :mod:`hyperloom.common.llm_config`, so this
+    cannot disagree with backend selection, the TraceLens runner or the forge
+    kernel_backend.
+
+    Args:
+        env: Environment mapping to read; defaults to ``os.environ``.
+
+    Returns:
+        :data:`AGENT_BACKEND_CODEX` for an OpenAI-only deployment, else
+        :data:`AGENT_BACKEND_CLAUDE`.
+    """
+    from hyperloom.common import llm_config  # local import: keep module import-light
+
+    return (
+        AGENT_BACKEND_CODEX
+        if llm_config.is_openai_only(env) or codex_cli_auth_requested(env)
+        else AGENT_BACKEND_CLAUDE
+    )
 
 
 def resolve_codex_executable(explicit: str = "") -> str:

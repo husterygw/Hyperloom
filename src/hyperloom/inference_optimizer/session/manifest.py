@@ -26,7 +26,7 @@ from .session_paths import manifest_path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def _git_revision() -> str:
@@ -243,6 +243,15 @@ def build_manifest(
         workload["isl"] = int(os.environ["ISL"]) if os.environ.get("ISL", "").strip().isdigit() else None
         workload["osl"] = int(os.environ["OSL"]) if os.environ.get("OSL", "").strip().isdigit() else None
     tp = int(os.environ["TP"]) if os.environ.get("TP", "").strip().isdigit() else None
+    pp = int(os.environ["PP"]) if os.environ.get("PP", "").strip().isdigit() else 1
+    target_id = os.environ.get("HYPERLOOM_TARGET", "").strip() or "amd_auto"
+    hardware_fingerprint: dict[str, Any] = {}
+    try:
+        parsed_hardware = json.loads(os.environ.get("HYPERLOOM_HARDWARE_FINGERPRINT", "") or "{}")
+        if isinstance(parsed_hardware, dict):
+            hardware_fingerprint = parsed_hardware
+    except json.JSONDecodeError:
+        pass
     if args is not None:
         if getattr(args, "model", None):
             model_path = str(args.model)
@@ -257,6 +266,16 @@ def build_manifest(
                 workload["isl"] = int(args.isl)
             if getattr(args, "osl", None) is not None:
                 workload["osl"] = int(args.osl)
+        if getattr(args, "target", None):
+            target_id = str(args.target)
+        if getattr(args, "pp", None) is not None:
+            pp = int(args.pp)
+        if isinstance(getattr(args, "hardware_fingerprint", None), dict):
+            hardware_fingerprint = dict(args.hardware_fingerprint)
+        if getattr(args, "isl", None) is not None:
+            workload["isl"] = int(args.isl)
+        if getattr(args, "osl", None) is not None:
+            workload["osl"] = int(args.osl)
         if getattr(args, "precision", None):
             workload["precision"] = str(args.precision)
     claw_session_id = (os.environ.get("CLAW_SESSION_ID") or "").strip() or None
@@ -277,9 +296,12 @@ def build_manifest(
         "model_name": model_name,
         "framework": framework or "sglang",
         "gpu_type": gpu_type,
+        "target_id": target_id,
+        "hardware_fingerprint": hardware_fingerprint,
         "tp": tp,
-        # Added provenance (schema v4) via the shared WP-0 builder so a trace consumer can pin gfx arch /
-        # expert-parallel / graph mode / server args.
+        "pp": pp,
+        # Added provenance via the shared WP-0 builder so a trace consumer can
+        # pin gfx arch / expert-parallel / graph mode / server args.
         "gfx_arch": _prov.get("gfx_arch"),
         "ep": _prov.get("ep"),
         "graph_mode": _prov.get("graph_mode"),

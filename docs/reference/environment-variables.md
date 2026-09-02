@@ -78,11 +78,15 @@ The following variables configure filesystem paths for Hyperloom's runtime depen
 ## Workload configuration
 
 Set with CLI flags, not env vars. Pre-set `ISL` / `OSL` / `CONC` / `PRECISION` /
-`TP` / `EP` env vars are ignored and overwritten (`GPU_TYPE` is a fallback when
+`TP` / `PP` / `EP` env vars are ignored and overwritten (`GPU_TYPE` is a fallback when
 `--gpu-type` is omitted).
 
+- **Execution target:** `--target amd_auto` (default) or the experimental
+  `--target nvidia_rtx4090_8x_local`. The latter publishes
+  `HYPERLOOM_TARGET_RUNTIME=cuda` and selects the `vllm_cuda` backend; these
+  derived env values are session-owned and should not be set independently.
 - **Model / workload shape:** `--model`, `--model-class`, `--framework`,
-  `--framework-version`, `--precision`, `--tp`, `--ep`, `--isl`, `--osl`,
+  `--framework-version`, `--precision`, `--tp`, `--pp`, `--ep`, `--isl`, `--osl`,
   `--conc`, `--max-model-len`, `--profile-osl`.
 - **Goal / budget:** `--target-gain`, `--target-roofline`, `--max-hours`,
   `--target-summary`, `--target-tput`, `--compare-against-gpu`. The roofline
@@ -444,7 +448,17 @@ metadata and credential-shaped values are dropped.
 
 ---
 
-## Codex (OpenAI) agent sandbox
+## Codex (OpenAI) CLI authentication and agent sandbox
+
+`--codex-cli-auth` (equivalently `HYPERLOOM_CODEX_CLI_AUTH=1`) explicitly
+allows Codex agents to reuse the current `codex login` ChatGPT session instead
+of requiring `OPENAI_BASE_URL` plus `OPENAI_API_KEY`. Hyperloom does not expose
+the ambient Codex home to an agent: it validates that the source `auth.json` is
+a small, owner-only regular file, copies it with mode `0600` into a private
+per-agent `CODEX_HOME`, and removes the private home at teardown. Gateway
+credentials take precedence when both forms are present. Merely having a Codex
+login on disk never enables this mode; the flag or environment opt-in is
+required.
 
 Selects how a Codex agent session (TraceLens analysis and every future
 Codex-based agent) is contained. The secure default is `workspace-write`.
@@ -465,7 +479,9 @@ immediately.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HYPERLOOM_`<br>`CODEX_SANDBOX_MODE` | `workspace-write` | `workspace-write` restricts writes to the session directory plus declared output roots; `read-only` forbids writes; `bypass` selects Codex full access when an external sandbox already enforces isolation. |
+| `HYPERLOOM_`<br>`CODEX_CLI_AUTH` | Unset | Set to `1` to opt into the current `codex login` ChatGPT credential. The CLI flag `--codex-cli-auth` is preferred for one-off runs. Explicit OpenAI gateway settings still win. |
+| `HYPERLOOM_`<br>`CODEX_SANDBOX_MODE` | `workspace-write` | `workspace-write` restricts writes to the session directory plus declared output roots; `read-only` forbids writes; `bypass` selects Codex full access only when the external-sandbox confirmation below is also set. |
+| `HYPERLOOM_`<br>`CODEX_EXTERNAL_`<br>`SANDBOX` | Unset | Set exactly to `1` only when an external isolation boundary is already active and `HYPERLOOM_CODEX_SANDBOX_MODE=bypass`. Setting this alone has no effect and never weakens the default sandbox. |
 
 ---
 

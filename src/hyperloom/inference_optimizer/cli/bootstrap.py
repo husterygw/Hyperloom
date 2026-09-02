@@ -23,15 +23,17 @@ from hyperloom.orchestrator.actions.executors._workload_envs import (
 )
 from hyperloom.orchestrator.phases.machine_state import bank_phase_segment
 from hyperloom.orchestrator.state.shared_state import SharedState
-from hyperloom.common.workload_defaults import (
+from ..target_registry import get_target
+from .backends import _build_robustness_options
+from .parser import (
     DEFAULT_ISL,
     DEFAULT_OSL,
     DEFAULT_CONC,
     DEFAULT_TP,
+    DEFAULT_PP,
     DEFAULT_EP,
     DEFAULT_PRECISION,
 )
-from .backends import _build_robustness_options
 from ..session.paths import _SESSION_SKELETON
 from ..session.session_paths import agent_prompt_snapshot
 from .model_gate import _load_model_arch, _load_model_config_tags
@@ -259,8 +261,14 @@ def _seed_shared_state(
         model_info=summarize_model_config(str(args.model)),
         framework=os.environ.get("FRAMEWORK", "sglang"),
         gpu_type=str(getattr(args, "gpu_type", None) or os.environ.get("GPU_TYPE", "")),
+        target_id=str(getattr(args, "target", None) or os.environ.get("HYPERLOOM_TARGET", "amd_auto")),
+        target_capabilities=get_target(
+            str(getattr(args, "target", None) or os.environ.get("HYPERLOOM_TARGET", "amd_auto"))
+        ).capabilities.to_dict(),
+        hardware_fingerprint=dict(getattr(args, "hardware_fingerprint", None) or {}),
         # Workload metadata mirrored from CLI/env.
         tp=_int_arg("tp", DEFAULT_TP),
+        pp=_int_arg("pp", DEFAULT_PP),
         ep=_int_arg("ep", DEFAULT_EP),
         precision=(str(getattr(args, "precision", None) or DEFAULT_PRECISION).strip()),
         framework_version=_resolve_framework_version(args),
@@ -305,6 +313,8 @@ def _seed_shared_state(
         ),
         # Standalone FRAMEWORK_AGENT phase; --no-framework-agent skips it.
         framework_agent_phase_enabled=not bool(getattr(args, "no_framework_agent", False)),
+        framework_agent_phase_done=(str(getattr(args, "target", "") or "") == "nvidia_rtx4090_8x_local"),
+        framework_agent_authoring_enabled=(str(getattr(args, "target", "") or "") != "nvidia_rtx4090_8x_local"),
         # FRAMEWORK local-exploration arm; --no-framework-local-explore opts out.
         framework_local_explore_enabled=not bool(getattr(args, "no_framework_local_explore", False)),
         # Enablement self-heal lanes; --enablement off opts out.

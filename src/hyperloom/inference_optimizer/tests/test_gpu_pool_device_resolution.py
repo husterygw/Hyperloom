@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 
 from hyperloom.orchestrator.bus.gpu_pool import (
+    GpuDeviceRef,
     SpecialistGpuPool,
     resolve_gpu_specialist_devices,
     resolve_whole_machine_devices,
@@ -187,4 +188,26 @@ async def test_try_acquire_reallocates_when_pool_shrinks(tmp_path) -> None:
     assert lease_b is not None
     assert set(lease_b.gpu_ids) <= {2, 3}, "re-acquired ids must all be in the current pool"
 
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_uuid_and_numa_metadata_survive_lease_roundtrip(tmp_path) -> None:
+    db = SqliteConnection(tmp_path / "test.db")
+    pool = SpecialistGpuPool(
+        db,
+        gpu_ids=[
+            GpuDeviceRef(index=4, uuid="GPU-four", numa_node=1),
+            GpuDeviceRef(index=5, uuid="GPU-five", numa_node=1),
+        ],
+    )
+    first = await pool.try_acquire(count=2, holder_id="h", task_id="t")
+    assert first is not None
+    assert first.gpu_ids == (4, 5)
+    assert first.gpu_uuids == ("GPU-four", "GPU-five")
+    assert first.numa_nodes == (1, 1)
+    second = await pool.try_acquire(count=2, holder_id="h", task_id="t")
+    assert second is not None
+    assert second.gpu_uuids == first.gpu_uuids
+    assert second.numa_nodes == first.numa_nodes
     db.close()

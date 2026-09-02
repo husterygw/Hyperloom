@@ -31,6 +31,7 @@ from hyperloom.inference_optimizer.protocol.action_surfaces import (
     COORDINATOR_OWNED_KERNEL_REQUEST_KINDS,
     KERNEL_AGENT_OWNED_ACTIONS,
     ROBUSTNESS_DELEGATE_ONLY_ACTIONS,
+    TARGET_CAPABILITY_ACTIONS,
 )
 from .projection import (
     RULE_GPU_EXCEEDS_CAPACITY,
@@ -178,7 +179,13 @@ def detect_gpu_count() -> int:
             ``CUDA_VISIBLE_DEVICES`` env masks (first one set wins), else the
             count parsed from ``rocm-smi``; 0 when nothing can be probed.
     """
-    for env_name in COUNTING_VISIBLE_DEVICE_VARS:
+    runtime = os.environ.get("HYPERLOOM_TARGET_RUNTIME", "rocm").strip().lower()
+    mask_order = (
+        ("CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES")
+        if runtime == "cuda"
+        else ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")
+    )
+    for env_name in mask_order:
         raw = os.environ.get(env_name)
         if raw is None:
             continue
@@ -190,6 +197,13 @@ def detect_gpu_count() -> int:
             return len(ids)
     import subprocess
 
+    if runtime == "cuda":
+        try:
+            from hyperloom.inference_optimizer.target_registry import discover_nvidia_devices
+
+            return len(discover_nvidia_devices())
+        except Exception:  # noqa: BLE001 - best-effort capacity probe
+            return 0
     try:
         proc = subprocess.run(
             ["rocm-smi", "--showid"],
@@ -222,6 +236,77 @@ def research_lane_ceiling() -> int:
     if gpus > 0:
         return 2 * gpus
     return RESEARCH_LANE_CEILING_FALLBACK
+
+
+def gpu_specialist_ceiling(shared_state: Any | None = None) -> int:
+    """Configured GPU specialist capacity (separate from serving lanes; 0 disables ``needs_gpu=true`` dispatch).
+
+    Args:
+        shared_state (Any | None): optional SharedState whose
+            ``gpu_specialist_capacity`` is read first; when ``None`` the value
+            comes from the ``INFERENCE_OPTIMIZER_GPU_SPECIALIST_CAPACITY`` env
+            var.
+
+    Returns:
+        int: the configured GPU specialist capacity (0 when unset or
+            unparseable).
+    """
+    if shared_state is not None:
+        try:
+            return max(0, int(getattr(shared_state, "gpu_specialist_capacity", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+    try:
+        return max(0, int(os.environ.get("INFERENCE_OPTIMIZER_GPU_SPECIALIST_CAPACITY", "0") or "0"))
+    except ValueError:
+        return 0
+
+
+def _serving_tp_for_policy(shared_state: Any | None = None) -> int:
+    """Resolve serving TP*PP world size for specialist GPU validation.
+
+    Mirrors ``Coordinator._resolve_serving_tp`` so PolicyGate rejects requests
+    that the dispatcher would later materialize into an unschedulable GPU lease.
+    """
+    if shared_state is not None:
+        try:
+            tp = int(getattr(shared_state, "tp", 0) or 0)
+            pp = max(1, int(getattr(shared_state, "pp", 1) or 1))
+        except (TypeError, ValueError):
+            tp = 0
+        if tp > 0:
+            return tp * pp
+    try:
+        tp = max(0, int(os.environ.get("TP", "0") or 0))
+        pp = max(1, int(os.environ.get("PP", "1") or 1))
+        return tp * pp
+    except ValueError:
+        return 0
+
+
+def _effective_gpu_specialist_pool_size(shared_state: Any | None = None) -> int:
+    """Actual policy-time GPU specialist pool size after serving carve."""
+    ceiling = gpu_specialist_ceiling(shared_state)
+    if ceiling <= 0:
+        return 0
+    return len(
+        resolve_gpu_specialist_devices(
+            ceiling,
+            serving_tp=_serving_tp_for_policy(shared_state),
+        ),
+    )
+
+
+def _whole_machine_pool_size() -> int:
+    """Policy-time size of the whole-machine (framework/bench) GPU pool.
+
+    Mirrors ``Coordinator.framework_gpu_pool`` (``resolve_whole_machine_devices``):
+    every visible card, with *no* serving carve and no
+    ``gpu_specialist_capacity`` gate. Used to validate whole-machine, time-shared
+    GPU specialists (framework-authoring + bench) which the dispatcher routes to
+    ``framework_gpu_pool`` rather than the serving-disjoint pool.
+    """
+    return len(resolve_whole_machine_devices())
 
 
 # Verdicts that allow ``integrate_patch`` without an operator override (``advise`` = soft approval, ``approve`` = green light).
@@ -444,6 +529,11 @@ CORE_STATE_FIELDS: frozenset[str] = frozenset(
         "model_path",
         "model_name",
         "model_class",
+        "target_id",
+        "target_capabilities",
+        "hardware_fingerprint",
+        "tp",
+        "pp",
         # The topology every number in the session was measured on, established
         # once at launch from a read of the card. Locked for the same reason as
         # model_path: it is provenance, not a decision, and a rewrite would file
@@ -631,6 +721,17 @@ class PolicyGate:
 
         payload = intent.payload or {}
 
+        if intent.type in (IntentType.DELEGATE, IntentType.PROPOSE_ACTION):
+            self._validate_target_capability(
+                str(payload.get("action_name") or ""),
+                payload.get("params") if isinstance(payload.get("params"), dict) else payload,
+            )
+        elif intent.type == IntentType.REQUEST:
+            self._validate_target_capability(
+                str(payload.get("action_name") or payload.get("kind") or ""),
+                payload.get("params") if isinstance(payload.get("params"), dict) else payload,
+            )
+
         # Per-intent structural validators
         if intent.type == IntentType.DELEGATE:
             self._validate_delegate(role, payload)
@@ -683,6 +784,7 @@ class PolicyGate:
         if not kind:
             raise PolicyDenied("dispatched task missing kind", rule="payload")
         params_dict = dict(params or {}) if isinstance(params, dict) else {}
+        self._validate_target_capability(kind, params_dict)
         payload = {"action_name": kind, "params": params_dict}
         role = self.role_registry.get("orchestration")
         if role is None:
@@ -700,6 +802,67 @@ class PolicyGate:
         if kind in COORDINATOR_INTERNAL_ACTIONS:
             return
         self._validate_delegate_body(role, payload, check_source=False, task_id=task_id)
+
+    def _validate_target_capability(self, action_name: str, params: Mapping[str, Any] | None = None) -> None:
+        """Deny an action family disabled by the persisted execution target."""
+        state = self.shared_state
+        capabilities = getattr(state, "target_capabilities", None) if state is not None else None
+        if not isinstance(capabilities, dict) or not capabilities:
+            return
+        action = str(action_name or "").strip()
+        required = TARGET_CAPABILITY_ACTIONS.get(action)
+        if action == SPECIALIST_ACTION_NAME:
+            details = params if isinstance(params, Mapping) else {}
+            if any(
+                bool(details.get(key))
+                for key in (
+                    "framework_agent_authoring",
+                    "write_patch",
+                    "source_patch",
+                    "kernel_patch",
+                )
+            ):
+                required = "source_patch"
+        if required is None or bool(capabilities.get(required, False)):
+            return
+        target_id = str(getattr(state, "target_id", "") or "unknown")
+        raise PolicyDenied(
+            f"action={action!r} requires target capability {required!r}, disabled by target={target_id!r}",
+            rule="target_capability",
+            hint=f"choose an action supported by {target_id}, or start a new session on a target with {required}",
+        )
+
+    def _closing_phase_denial(
+        self,
+        source: str,
+        intent: Intent,
+    ) -> PolicyDenied | None:
+        """During closing phase, allow only harmless intents and ``report`` proposals.
+
+        Args:
+            source (str): the identity of the emitting agent.
+            intent (Intent): the intent being evaluated.
+
+        Returns:
+            PolicyDenied | None: ``None`` when the intent is permitted (or no
+                closing phase is active); otherwise a :class:`PolicyDenied`
+                describing the wind-down rejection.
+        """
+        state = self.shared_state
+        if state is None or not getattr(state, "closing_phase", False):
+            return None
+        if intent.type in (
+            IntentType.SEND_MESSAGE,
+            IntentType.ALERT,
+        ):
+            return None
+        if intent.type == IntentType.PROPOSE_ACTION and (intent.payload or {}).get("action_name") == "report":
+            return None
+        return PolicyDenied(
+            f"closing_phase: {intent.type.value} denied (only `report` proposals allowed during wind-down)",
+            rule="closing_phase_only_report",
+            hint="run is winding down; new tasks are dropped",
+        )
 
     def allowed_tools_for_agent(self, agent_name: str) -> list[str]:
         """Return the Claude tool list a reactor may use (Codex → []; Claude → emit_intent; orchestration also gets context-pull tools + sandboxed Read + web search).

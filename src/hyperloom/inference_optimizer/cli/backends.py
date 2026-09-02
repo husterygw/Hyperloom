@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from .. import framework_registry
 from hyperloom.common import llm_config
+from hyperloom.common.codex_session import codex_cli_auth_requested
 from hyperloom.common.llm_config import has_anthropic_credential
 from hyperloom.inference_optimizer.session.session_paths import agent_dir
 from hyperloom.orchestrator.roles import (
@@ -111,7 +112,9 @@ def _build_backends(
     # _preflight() derives OPENAI_BASE_URL from ANTHROPIC_BASE_URL.
     provider_anthropic_only = codex_follows_claude or _official_anthropic_only()
     provider_openai_only = (not codex_follows_claude) and (
-        _official_openai_only() or os.environ.get("INFERENCE_OPTIMIZER_CLAUDE_FOLLOWS_CODEX") == "1"
+        _official_openai_only()
+        or codex_cli_auth_requested()
+        or os.environ.get("INFERENCE_OPTIMIZER_CLAUDE_FOLLOWS_CODEX") == "1"
     )
 
     if critic_choice == "mock":

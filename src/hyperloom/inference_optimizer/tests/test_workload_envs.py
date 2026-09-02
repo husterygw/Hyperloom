@@ -30,6 +30,7 @@ def _restore_environ():
 def _clear_env(monkeypatch):
     for k in (
         "TP",
+        "PP",
         "EP",
         "ISL",
         "OSL",
@@ -38,6 +39,8 @@ def _clear_env(monkeypatch):
         "PRECISION",
         "RANDOM_RANGE_RATIO",
         "ROCR_VISIBLE_DEVICES",
+        "CUDA_VISIBLE_DEVICES",
+        "HYPERLOOM_TARGET_RUNTIME",
         "RUN_EVAL",
         "PROFILE",
         "MODEL_PATH",

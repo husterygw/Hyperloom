@@ -121,6 +121,35 @@ NO_KERNEL_AGENT_ENABLED_ACTIONS: tuple[str, ...] = (
 )
 
 
+# Action/request name -> execution-target capability family. This is shared by
+# prompt filtering and PolicyGate so target policy does not drift between the
+# advisory surface and the authoritative dispatch chokepoint.
+TARGET_CAPABILITY_ACTIONS: Mapping[str, str] = MappingProxyType(
+    {
+        "baseline": "baseline",
+        "explore": "config_explore",
+        "sweep": "sweep",
+        "conc_sweep": "sweep",
+        "report": "report",
+        "session_breakdown": "report",
+        "profile": "profile",
+        "roofline": "profile",
+        "trace_analyze": "profile",
+        "record_trace_analyze": "profile",
+        "integrate_patch": "source_patch",
+        "replay_warm_recipe": "source_patch",
+        "framework_targeted_build": "source_patch",
+        "targeted_build": "source_patch",
+        "kernel_opt": "kernel_patch",
+        "run_optimization": "kernel_patch",
+        "integrate": "kernel_patch",
+        "apply_patch": "kernel_patch",
+        "gemm_tuning": "kernel_patch",
+        "run_gemm_tuning": "kernel_patch",
+    }
+)
+
+
 @dataclass(frozen=True)
 class ActionMetadata:
     """One action's dispatch contract plus its prompt-catalogue copy."""
@@ -394,4 +423,5 @@ __all__ = [
     "NO_KERNEL_AGENT_ENABLED_ACTIONS",
     "REQUEST_KIND_TO_OWNED_ACTION",
     "ROBUSTNESS_DELEGATE_ONLY_ACTIONS",
+    "TARGET_CAPABILITY_ACTIONS",
 ]

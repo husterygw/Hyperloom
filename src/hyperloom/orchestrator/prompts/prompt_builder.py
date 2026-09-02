@@ -28,6 +28,7 @@ from hyperloom.inference_optimizer.protocol.action_surfaces import (
     KERNEL_ACTION_REQUEST_KINDS,
     KERNEL_AGENT_OWNED_ACTIONS,
     NO_KERNEL_AGENT_ENABLED_ACTIONS,
+    TARGET_CAPABILITY_ACTIONS,
 )
 from hyperloom.common.perf_metric import graded_metric_key, is_agentx_mode
 from . import read_rules_fragment as _read_rules_fragment
@@ -1096,6 +1097,7 @@ def default_enabled_actions(
     *,
     no_kernel: bool,
     no_optimize: bool = False,
+    target_capabilities: Mapping[str, bool] | None = None,
 ) -> tuple[str, ...]:
     """Return the canonical enabled-action set used by the CLI.
 
@@ -1108,6 +1110,9 @@ def default_enabled_actions(
             intersection with :data:`NO_KERNEL_AGENT_ENABLED_ACTIONS`).
         no_optimize (bool): When ``True``, drop the ``explore`` grid-runner
             action: the phase that dispatches it is skipped.
+        target_capabilities: Optional execution-target capability map. Actions
+            whose required family is explicitly disabled are hidden from the
+            prompt; PolicyGate independently enforces the same catalogue.
 
     Returns:
         tuple[str, ...]: The filtered enabled-action set, preserving
@@ -1118,6 +1123,13 @@ def default_enabled_actions(
         actions = [a for a in actions if a in NO_KERNEL_AGENT_ENABLED_ACTIONS]
     if no_optimize:
         actions = [a for a in actions if a != "explore"]
+    if target_capabilities:
+        actions = [
+            action
+            for action in actions
+            if (required := TARGET_CAPABILITY_ACTIONS.get(action)) is None
+            or bool(target_capabilities.get(required, False))
+        ]
     return tuple(actions)
 
 

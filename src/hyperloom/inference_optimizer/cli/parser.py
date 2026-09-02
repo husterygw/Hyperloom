@@ -12,6 +12,7 @@ from typing import NoReturn
 
 from .. import framework_registry
 from .backends import CRITIC_PROTOCOL_CHOICES
+from hyperloom.common.codex_session import CODEX_CLI_AUTH_ENV
 from hyperloom.common.gpu_identity import AMD_GPU_DISPATCH_IDENTITIES
 from hyperloom.common.llm_config import provider_model_defaults
 
@@ -30,6 +31,19 @@ from hyperloom.orchestrator.roles.agent_role import (
     DEFAULT_CODEX_MODEL,
 )
 from hyperloom.orchestrator.scoring.proposal_scorer import DEFAULT_SCORER_MODELS
+
+# Workload knob fallbacks applied when the operator passes neither the CLI flag
+# nor an inherited value. Flags default to ``None`` so "omitted" is
+# distinguishable from "typed the default"; the resolver in ``cli`` applies
+# these constants only for genuinely-unset knobs (issue #903).
+DEFAULT_ISL = 1024
+DEFAULT_OSL = 1024
+DEFAULT_CONC = 64
+DEFAULT_TP = 1
+DEFAULT_PP = 1
+DEFAULT_EP = 1
+DEFAULT_PRECISION = "bf16"
+
 
 # Substrings that mark a flag or a NAME=VALUE name as carrying a credential.
 _SECRET_NAME_HINTS = (
@@ -161,6 +175,25 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     opt = sub.add_parser("optimize", help="Drive a multi-agent optimization run on a model")
+    from ..target_registry import DEFAULT_TARGET, target_names
+
+    opt.add_argument(
+        "--target",
+        choices=target_names(),
+        default=None,
+        help="Execution target. Resolution: --target > HYPERLOOM_TARGET > "
+        f"{DEFAULT_TARGET}. NVIDIA support is an explicit target and does not "
+        "reuse the AMD --gpu-type board enum.",
+    )
+    opt.add_argument(
+        "--codex-cli-auth",
+        action=argparse.BooleanOptionalAction,
+        default=(os.environ.get(CODEX_CLI_AUTH_ENV) or "").strip().lower()
+        in {"1", "true", "yes", "on"},
+        help="Use the existing `codex login` ChatGPT session for orchestration "
+        "when no OPENAI/Anthropic gateway variables are configured. The auth "
+        "file is copied into private per-run state and removed at teardown.",
+    )
     opt.add_argument(
         "--model",
         "-m",
@@ -322,6 +355,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Tensor parallel size. Pass `--tp N` directly from the prompt's "
         f"Environment block. Default: {DEFAULT_TP}.",
+    )
+    opt.add_argument(
+        "--pp",
+        type=_positive_int_arg,
+        default=None,
+        help=f"Pipeline parallel size. GPU world size is TP*PP. Default: {DEFAULT_PP}.",
     )
     opt.add_argument(
         "--conc",
