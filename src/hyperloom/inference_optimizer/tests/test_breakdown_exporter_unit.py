@@ -139,6 +139,25 @@ def test_write_minimal_final_report_idempotent(tmp_path):
     assert again.read_text() == "PRESERVED"
 
 
+def test_write_minimal_final_report_refreshes_stale_fallback(tmp_path):
+    from hyperloom.orchestrator.state.shared_state import SharedState
+
+    target = ex.write_minimal_final_report(tmp_path)
+    assert "emergency final report" in target.read_text(encoding="utf-8")
+
+    state = SharedState.load_or_init(tmp_path)
+    state.baseline_tput = 42.0
+    state.current_best = {"action": "explore", "tput": 84.0}
+    state.cumulative_gain_validated = 100.0
+    state.save(tmp_path)
+
+    again = ex.write_minimal_final_report(tmp_path)
+    text = again.read_text(encoding="utf-8")
+    assert "baseline       : `42.00 tok/s/GPU`" in text
+    assert "current_best   : `explore` @ `84.00 tok/s/GPU`" in text
+    assert "cumul_gain     : `100.00%`" in text
+
+
 def test_write_minimal_final_report_with_attempts(tmp_path):
     from hyperloom.orchestrator.state.shared_state import SharedState
 

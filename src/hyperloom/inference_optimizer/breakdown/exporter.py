@@ -452,15 +452,37 @@ def write_minimal_final_report(
     *,
     output_path: Path | str | None = None,
 ) -> Path:
-    """cli.finally safety-net for ``reports/final.md`` when the CLOSE sequencer never reached step 1."""
+    """cli.finally safety-net for ``reports/final.md`` when the CLOSE sequencer never reached step 1.
+
+    Stays minimal (one SharedState read) so it does not block shutdown.
+    A full report is never overwritten. A prior emergency report is refreshed
+    after resume so its headline metrics cannot remain stale while
+    ``final.json`` reflects the resumed leg.
+
+    Args:
+        session_dir: The hyperloom session directory.
+        output_path: Destination file; defaults to
+            ``<session_dir>/reports/final.md``.
+
+    Returns:
+        The path of the (existing or newly written) ``final.md`` file.
+
+    Raises:
+        OSError: If the destination cannot be read or written; returning a
+            path to a file that was never written would be worse. The
+            teardown caller logs it rather than masking the stop_reason.
+    """
     from hyperloom.orchestrator.state.shared_state import SharedState
     from ..session.session_paths import reports_dir
 
     sd = Path(session_dir).resolve()
     target = Path(output_path).resolve() if output_path else reports_dir(sd) / "final.md"
     target.parent.mkdir(parents=True, exist_ok=True)
+    emergency_heading = "# Inference Optimizer — emergency final report"
     if target.exists() and target.stat().st_size > 0:
-        return target
+        existing = target.read_text(encoding="utf-8")
+        if emergency_heading not in existing:
+            return target
 
     state = SharedState.load_or_init(sd)
     breakdown_link = sd / BREAKDOWN_FILENAME
@@ -491,7 +513,7 @@ def write_minimal_final_report(
         else "-"
     )
     lines = [
-        "# Inference Optimizer — emergency final report",
+        emergency_heading,
         "",
         "> **Auto-generated safety-net.** The CLOSE phase 7-step "
         + "sequencer did not run to completion (process exited before "
