@@ -91,11 +91,27 @@ def test_registry_keeps_amd_default_and_explicit_nvidia_target(monkeypatch):
 
 def test_cli_parses_target_and_pipeline_parallelism():
     args = _build_parser().parse_args(
-        ["optimize", "--model", "/models/qwen", "--target", NVIDIA_LOCAL_TARGET, "--tp", "1", "--pp", "8"]
+        [
+            "optimize",
+            "--model",
+            "/models/qwen",
+            "--target",
+            NVIDIA_LOCAL_TARGET,
+            "--tp",
+            "1",
+            "--pp",
+            "8",
+            "--num-prompts",
+            "100",
+            "--num-warmups",
+            "0",
+        ]
     )
     assert args.target == NVIDIA_LOCAL_TARGET
     assert args.tp == 1
     assert args.pp == 8
+    assert args.num_prompts == 100
+    assert args.num_warmups == 0
     with pytest.raises(SystemExit):
         _build_parser().parse_args(["optimize", "--model", "/models/qwen", "--pp", "0"])
 
@@ -217,11 +233,13 @@ def test_nvidia_host_validation_rejects_missing_required_vllm_cli_capability(mon
 
 def test_v6_state_migrates_target_and_pp_defaults():
     state = SharedState.from_dict({"schema_version": 6, "session_id": "old", "tp": 4})
-    assert state.schema_version == LATEST_STATE_SCHEMA_VERSION == 7
+    assert state.schema_version == LATEST_STATE_SCHEMA_VERSION == 8
     assert state.target_id == DEFAULT_TARGET
     assert state.target_capabilities == {}
     assert state.hardware_fingerprint == {}
     assert state.pp == 1
+    assert state.num_prompts is None
+    assert state.num_warmups is None
 
 
 def test_prompt_and_policy_filter_disabled_target_actions():

@@ -671,6 +671,28 @@ def _operator_extra_env() -> dict[str, str]:
     return {str(k).strip(): str(v) for k, v in parsed.items() if str(k).strip()}
 
 
+def _operator_request_count(name: str, *, allow_zero: bool) -> int | None:
+    """Read one first-class serving-request-count pin from the CLI handoff.
+
+    ``NUM_PROMPTS`` and ``NUM_WARMUPS`` are intentionally not accepted through
+    generic ``--extra-env``: variants and untrusted recipes must not be able to
+    retarget the measurement contract. The public CLI flags are exported under
+    these internal names instead, then applied while materializing the YAML.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        log.warning("Ignoring invalid %s=%r", name, raw)
+        return None
+    if value < 0 or (value == 0 and not allow_zero):
+        log.warning("Ignoring invalid %s=%r", name, raw)
+        return None
+    return value
+
+
 def resolve_reference_base() -> tuple[str, dict[str, str]]:
     """Read the ``--reference-script`` server args / envs from SharedState.
 
@@ -1646,10 +1668,20 @@ def materialize_config_with_envs(
     if not _is_scriptable_profile:
         # NUM_PROMPTS / NUM_WARMUPS are serving-request concepts; xDiT drives its
         # own iteration count, so leave them untouched.
+        operator_num_prompts = _operator_request_count(
+            "INFERENCE_OPTIMIZER_NUM_PROMPTS",
+            allow_zero=False,
+        )
+        operator_num_warmups = _operator_request_count(
+            "INFERENCE_OPTIMIZER_NUM_WARMUPS",
+            allow_zero=True,
+        )
         if profile_num_prompts is not None:
             # Profile mode: force-override NUM_PROMPTS to reach the steady-state
             # window.
             envs["NUM_PROMPTS"] = profile_num_prompts
+        elif operator_num_prompts is not None:
+            envs["NUM_PROMPTS"] = operator_num_prompts
         else:
             seq_cost = isl_val + osl_val
             if seq_cost <= 1024:
@@ -1662,7 +1694,9 @@ def materialize_config_with_envs(
                 factor = 2
             if "NUM_PROMPTS" not in envs:
                 envs["NUM_PROMPTS"] = max(conc_val * factor, conc_val)
-        if "NUM_WARMUPS" not in envs:
+        if operator_num_warmups is not None:
+            envs["NUM_WARMUPS"] = operator_num_warmups
+        elif "NUM_WARMUPS" not in envs:
             envs["NUM_WARMUPS"] = min(conc_val, 8)
     # ── reference-script base (lowest priority) ────────────────────────────
     # Seed the framework server-args env + envs from a reference recipe below

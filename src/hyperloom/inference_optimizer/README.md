@@ -84,6 +84,7 @@ python -m hyperloom.inference_optimizer.cli optimize \
     --framework vllm \
     --tp 1 --pp 8 \
     --isl 128 --osl 32 --conc 2 \
+    --num-prompts 100 --num-warmups 5 \
     --max-hours 2
 ```
 
@@ -105,6 +106,12 @@ an atomic `vllm_cuda_benchmark.json`, the compatibility
 per-GPU tok/s, and p50/p90/p99 latency metrics. GPU leases retain physical
 index, UUID, and NUMA identity, and cleanup only terminates the session-owned
 process group.
+
+`--num-prompts` and `--num-warmups` optionally pin the serving measurement
+protocol for every non-profile run; they are persisted in `state.json` and
+restored by `--resume-from`. This is the supported way to request a fixed
+sample size (for example, P3's 100 continuous requests); generic `--extra-env`
+does not retarget these workload-owned values.
 
 ## Layout
 

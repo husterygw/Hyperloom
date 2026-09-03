@@ -266,6 +266,18 @@ def test_num_prompts_factor(monkeypatch, tmp_path, isl, osl, conc, factor):
     assert bench["envs"]["NUM_PROMPTS"] == conc * factor
 
 
+def test_operator_request_counts_override_adaptive_defaults(monkeypatch, tmp_path):
+    """Explicit CLI request counts survive YAML materialization unchanged."""
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_DISABLE_TP_CLAMP", "1")
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_NUM_PROMPTS", "100")
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_NUM_WARMUPS", "0")
+    src = _write(tmp_path / "cfg.yaml")
+    bench = _materialize(src, tmp_path / "out")
+    assert bench["envs"]["NUM_PROMPTS"] == 100
+    assert bench["envs"]["NUM_WARMUPS"] == 0
+
+
 def test_server_args_merge_existing(monkeypatch, tmp_path):
     _clear_env(monkeypatch)
     monkeypatch.setenv("INFERENCE_OPTIMIZER_DISABLE_TP_CLAMP", "1")

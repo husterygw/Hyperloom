@@ -275,6 +275,16 @@ def _seed_shared_state(
         conc=_int_arg("conc", DEFAULT_CONC),
         isl=_int_arg("isl", DEFAULT_ISL),
         osl=_int_arg("osl", DEFAULT_OSL),
+        num_prompts=(
+            int(getattr(args, "num_prompts"))
+            if getattr(args, "num_prompts", None) is not None
+            else None
+        ),
+        num_warmups=(
+            int(getattr(args, "num_warmups"))
+            if getattr(args, "num_warmups", None) is not None
+            else None
+        ),
         profile_osl=_int_arg("profile_osl", 0),
         max_model_len=_int_arg("max_model_len", 0),
         kernel_enabled=not getattr(args, "no_kernel", False),

@@ -115,6 +115,17 @@ def _positive_int_arg(value: str) -> int:
     return parsed
 
 
+def _non_negative_int_arg(value: str) -> int:
+    """argparse type for non-negative integer knobs."""
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value!r}") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value!r}")
+    return parsed
+
+
 def _default_claude_model_env() -> str:
     """Resolve the default Claude model from env."""
     explicit = (os.environ.get("CLAUDE_MODEL") or "").strip()
@@ -369,6 +380,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Magpie client concurrency cap (max in-flight requests). "
         "Pass `--conc N` directly from the prompt. Use "
         f"--conc-sweep-concs for a concurrency ladder. Default: {DEFAULT_CONC}.",
+    )
+    opt.add_argument(
+        "--num-prompts",
+        type=_positive_int_arg,
+        default=None,
+        help="Fixed measured-request count for each non-profile serving run. "
+        "When omitted, Hyperloom derives a count from --conc and the sequence lengths.",
+    )
+    opt.add_argument(
+        "--num-warmups",
+        type=_non_negative_int_arg,
+        default=None,
+        help="Fixed warmup-request count for each non-profile serving run; 0 disables warmup. "
+        "When omitted, Hyperloom derives it from --conc.",
     )
     opt.add_argument(
         "--max-model-len",

@@ -26,9 +26,15 @@ from hyperloom.orchestrator.actions.executors._workload_envs import (
 )
 
 
-# ``_export_workload_envs_for_optimize`` writes TP/CONC/EP straight into ``os.environ``, which ``monkeypatch`` cannot
-# undo, so restore them here.
-_EXPORTED_WORKLOAD_ENVS = ("TP", "CONC", "EP")
+# ``_export_workload_envs_for_optimize`` writes TP/CONC/EP straight into
+# ``os.environ``, which ``monkeypatch`` cannot undo, so restore them here.
+_EXPORTED_WORKLOAD_ENVS = (
+    "TP",
+    "CONC",
+    "EP",
+    "INFERENCE_OPTIMIZER_NUM_PROMPTS",
+    "INFERENCE_OPTIMIZER_NUM_WARMUPS",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -43,7 +49,7 @@ def _restore_exported_workload_envs():
 
 
 def _ns(**kwargs) -> argparse.Namespace:
-    defaults = {"conc": 64}
+    defaults = {"conc": 64, "num_prompts": None, "num_warmups": None}
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
 
@@ -176,6 +182,22 @@ def test_multi_node_always_exports_workload_envs(monkeypatch):
     assert os.environ["TP"] == "8"
     assert os.environ["CONC"] == "32"
     assert os.environ["EP"] == "2"
+
+
+def test_explicit_request_counts_export_to_the_materializer(monkeypatch):
+    """Public request-count flags use the trusted internal handoff, not --extra-env."""
+    for key in ("INFERENCE_OPTIMIZER_NUM_PROMPTS", "INFERENCE_OPTIMIZER_NUM_WARMUPS"):
+        monkeypatch.delenv(key, raising=False)
+
+    _export_workload_envs_for_optimize(
+        _ns(conc=1, num_prompts=100, num_warmups=0),
+        nodes_resolved=1,
+        tp_resolved=1,
+        ep_resolved=1,
+    )
+
+    assert os.environ["INFERENCE_OPTIMIZER_NUM_PROMPTS"] == "100"
+    assert os.environ["INFERENCE_OPTIMIZER_NUM_WARMUPS"] == "0"
 
 
 def test_operator_server_args_env_routes_to_vllm_args(tmp_path, monkeypatch):

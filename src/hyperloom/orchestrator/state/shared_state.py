@@ -345,7 +345,7 @@ _KEY_METRIC_MAP: dict[str, tuple[str, str]] = {
 
 
 #: top-level state.json schema version; absent key treated as v1 and migrated to LATEST_STATE_SCHEMA_VERSION on first save.
-LATEST_STATE_SCHEMA_VERSION: int = 7
+LATEST_STATE_SCHEMA_VERSION: int = 8
 
 
 def effective_closing_grace_sec(
@@ -462,7 +462,12 @@ class SharedState(_RenderMixin, _ExploreStateMixin):
     conc: int = 0
     isl: int = 0
     osl: int = 0
-    # Profile-phase output length (from --profile-osl). 0 = unset (profile defaults to min(osl, 1024)).
+    # Optional operator pins for the serving measurement protocol. ``None``
+    # preserves the adaptive request-count policy; zero warmups is explicit.
+    num_prompts: int | None = None
+    num_warmups: int | None = None
+    # Profile-phase output length (from --profile-osl). 0 = unset (profile
+    # defaults to min(osl, 1024)). Persisted across resume.
     profile_osl: int = 0
     max_model_len: int = 0
     kernel_enabled: bool = True
@@ -1210,6 +1215,10 @@ class SharedState(_RenderMixin, _ExploreStateMixin):
             filtered.setdefault("target_capabilities", {})
             filtered.setdefault("hardware_fingerprint", {})
             filtered.setdefault("pp", 1)
+
+        if incoming_version < 8:
+            filtered.setdefault("num_prompts", None)
+            filtered.setdefault("num_warmups", None)
 
         if isinstance(filtered.get("enablement"), dict):
             filtered["enablement"] = EnablementRound.from_dict(filtered["enablement"])

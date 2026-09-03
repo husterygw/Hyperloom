@@ -1146,6 +1146,16 @@ def _resolve_workload_knobs(
             persisted = int(getattr(state, name, 0) or 0) if state is not None else 0
             val = persisted if persisted > 0 else default
         setattr(args, name, int(val))
+    # Request counts deliberately have no global default: ``None`` means use
+    # the materializer's adaptive measurement policy. Keep that distinction so
+    # an explicit ``--num-warmups 0`` survives a resume.
+    for name in ("num_prompts", "num_warmups"):
+        val = getattr(args, name, None)
+        if val is None and state is not None:
+            persisted = getattr(state, name, None)
+            if persisted is not None:
+                val = int(persisted)
+        setattr(args, name, val)
     precision = getattr(args, "precision", None)
     if not precision:
         persisted = (getattr(state, "precision", "") or "").strip() if state is not None else ""
@@ -1202,6 +1212,15 @@ def _export_workload_envs_for_optimize(
         os.environ.pop("PP", None)
     os.environ["CONC"] = str(max(1, int(getattr(args, "conc", DEFAULT_CONC) or DEFAULT_CONC)))
     os.environ["EP"] = str(max(1, int(ep_resolved or 1)))
+    for arg_name, env_name in (
+        ("num_prompts", "INFERENCE_OPTIMIZER_NUM_PROMPTS"),
+        ("num_warmups", "INFERENCE_OPTIMIZER_NUM_WARMUPS"),
+    ):
+        value = getattr(args, arg_name, None)
+        if value is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = str(int(value))
 
 
 def _export_operator_launch_shape(
@@ -1813,8 +1832,20 @@ async def _run_optimize(args: argparse.Namespace) -> int:
             if val:
                 os.environ[env_name] = str(int(val))
                 print(f"  re-exported {env_name:<14s}: {int(val)}")
-        # Profile-scoped OSL: an explicit --profile-osl on this resume wins; otherwise re-export the value persisted
-        # from the original run.
+        for attr_name, env_name in (
+            ("num_prompts", "INFERENCE_OPTIMIZER_NUM_PROMPTS"),
+            ("num_warmups", "INFERENCE_OPTIMIZER_NUM_WARMUPS"),
+        ):
+            value = getattr(args, attr_name, None)
+            if value is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = str(int(value))
+                print(f"  re-exported {attr_name:<14s}: {int(value)}")
+        state.num_prompts = getattr(args, "num_prompts", None)
+        state.num_warmups = getattr(args, "num_warmups", None)
+        # Profile-scoped OSL: an explicit --profile-osl on this resume wins;
+        # otherwise re-export the value persisted from the original run.
         _resume_profile_osl = getattr(args, "profile_osl", None) or getattr(state, "profile_osl", 0)
         if _resume_profile_osl:
             os.environ["PROFILE_OSL"] = str(int(_resume_profile_osl))
