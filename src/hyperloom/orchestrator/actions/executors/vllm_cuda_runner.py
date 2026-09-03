@@ -12,6 +12,7 @@ rows it created; it never scans for or kills unrelated GPU processes.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -93,6 +94,29 @@ class _Lease:
     gpu_ids: tuple[int, ...]
     gpu_uuids: tuple[str, ...]
     numa_nodes: tuple[int | None, ...]
+
+
+def _cleanup_signal_handler(_signum: int, _frame: Any) -> None:
+    """Turn SIGTERM into the same cleanup path as Ctrl-C."""
+    raise KeyboardInterrupt
+
+
+def _install_parent_death_cleanup() -> None:
+    """Ensure an interrupted coordinator cannot orphan a CUDA server.
+
+    The runner owns a separate vLLM process group.  Its Linux parent-death
+    signal interrupts the runner when the executor disappears, and SIGTERM is
+    normalized to ``KeyboardInterrupt`` so ``run_benchmark`` releases that
+    process group and its GPU lease through its existing cleanup path.
+    """
+    signal.signal(signal.SIGTERM, _cleanup_signal_handler)
+    if not sys.platform.startswith("linux"):
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    # PR_SET_PDEATHSIG is Linux's per-process parent-death notification.
+    if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno))
 
 
 def _int(value: Any, default: int = 0) -> int:
@@ -844,8 +868,9 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
+        _install_parent_death_cleanup()
         return run_benchmark(args.benchmark_config, args.output_dir)
-    except Exception as exc:  # noqa: BLE001 - pre-workspace/config failures
+    except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - pre-workspace/config failures
         print(f"vllm_cuda_runner: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 
@@ -858,6 +883,8 @@ __all__ = [
     "LaunchPlan",
     "SCHEMA_VERSION",
     "SUPPORTED_EXTRA_VLLM_FLAGS",
+    "_cleanup_signal_handler",
+    "_install_parent_death_cleanup",
     "main",
     "normalize_vllm_result",
     "run_benchmark",

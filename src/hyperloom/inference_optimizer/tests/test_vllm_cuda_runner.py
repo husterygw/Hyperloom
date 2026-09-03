@@ -184,6 +184,11 @@ def test_extra_args_cannot_override_runner_owned_topology():
         runner._tokenize_extra_args({"EXTRA_VLLM_ARGS": "--future-unpinned-knob 1"})
 
 
+def test_cuda_runner_normalizes_sigterm_to_its_cleanup_path():
+    with pytest.raises(KeyboardInterrupt):
+        runner._cleanup_signal_handler(15, None)
+
+
 def test_gpu_lease_persists_uuid_and_numa_and_is_idempotent(tmp_path, monkeypatch):
     session_dir = _cuda_env(monkeypatch, tmp_path, visible="0,1")
     first = runner._acquire_gpu_lease(gpu_ids=(0, 1), stable_key="stable", ttl_sec=120)
