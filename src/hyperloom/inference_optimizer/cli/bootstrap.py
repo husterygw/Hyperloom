@@ -285,6 +285,7 @@ def _seed_shared_state(
             if getattr(args, "num_warmups", None) is not None
             else None
         ),
+        quality_suite=str(getattr(args, "quality_suite", "smoke") or "smoke"),
         profile_osl=_int_arg("profile_osl", 0),
         max_model_len=_int_arg("max_model_len", 0),
         kernel_enabled=not getattr(args, "no_kernel", False),

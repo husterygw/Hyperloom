@@ -9,6 +9,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -187,6 +188,50 @@ def test_extra_args_cannot_override_runner_owned_topology():
 def test_cuda_runner_normalizes_sigterm_to_its_cleanup_path():
     with pytest.raises(KeyboardInterrupt):
         runner._cleanup_signal_handler(15, None)
+
+
+def test_qwen3_p3_quality_suite_persists_the_semantic_matrix(tmp_path, monkeypatch):
+    """P3 stores all four prompt classes, not just a pass/fail bit."""
+    model = tmp_path / "qwen3"
+    model.mkdir()
+    (model / "config.json").write_text('{"model_type":"qwen3"}', encoding="utf-8")
+
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, enable_thinking):
+            content = str(messages[0]["content"])
+            return f"thinking={enable_thinking}\n{content}"
+
+        def __call__(self, prompt, *, add_special_tokens):
+            return {"input_ids": list(range(160 if "背景资料" in prompt or "Background" in prompt else 16))}
+
+    class FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(path, *, local_files_only):
+            assert path == str(model)
+            assert local_files_only is True
+            return FakeTokenizer()
+
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoTokenizer=FakeAutoTokenizer))
+    monkeypatch.setattr(runner, "_json_request", lambda *args, **kwargs: {"choices": [{"text": "ok"}]})
+    artifact = tmp_path / "quality_cases.json"
+
+    gate = runner._qwen3_p3_quality_gate(
+        "http://127.0.0.1:1",
+        "model",
+        str(model),
+        artifact_path=artifact,
+    )
+
+    persisted = json.loads(artifact.read_text(encoding="utf-8"))
+    assert gate["passed"] is True
+    assert gate["semantic_case_count"] == 4
+    assert {(row["language"], row["length"], row["enable_thinking"]) for row in persisted["cases"]} == {
+        ("zh", "short", True),
+        ("en", "short", False),
+        ("zh", "long", False),
+        ("en", "long", True),
+    }
+    assert all(row["completion"] == "ok" for row in persisted["cases"])
 
 
 def test_gpu_lease_persists_uuid_and_numa_and_is_idempotent(tmp_path, monkeypatch):

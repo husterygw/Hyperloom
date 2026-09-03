@@ -1156,6 +1156,10 @@ def _resolve_workload_knobs(
             if persisted is not None:
                 val = int(persisted)
         setattr(args, name, val)
+    quality_suite = str(getattr(args, "quality_suite", "") or "")
+    if not quality_suite and state is not None:
+        quality_suite = str(getattr(state, "quality_suite", "") or "")
+    args.quality_suite = quality_suite or "smoke"
     precision = getattr(args, "precision", None)
     if not precision:
         persisted = (getattr(state, "precision", "") or "").strip() if state is not None else ""
@@ -1221,6 +1225,9 @@ def _export_workload_envs_for_optimize(
             os.environ.pop(env_name, None)
         else:
             os.environ[env_name] = str(int(value))
+    os.environ["INFERENCE_OPTIMIZER_QUALITY_SUITE"] = str(
+        getattr(args, "quality_suite", "smoke") or "smoke"
+    )
 
 
 def _export_operator_launch_shape(
@@ -1844,6 +1851,9 @@ async def _run_optimize(args: argparse.Namespace) -> int:
                 print(f"  re-exported {attr_name:<14s}: {int(value)}")
         state.num_prompts = getattr(args, "num_prompts", None)
         state.num_warmups = getattr(args, "num_warmups", None)
+        state.quality_suite = str(getattr(args, "quality_suite", "smoke") or "smoke")
+        os.environ["INFERENCE_OPTIMIZER_QUALITY_SUITE"] = state.quality_suite
+        print(f"  re-exported quality_suite  : {state.quality_suite}")
         # Profile-scoped OSL: an explicit --profile-osl on this resume wins;
         # otherwise re-export the value persisted from the original run.
         _resume_profile_osl = getattr(args, "profile_osl", None) or getattr(state, "profile_osl", 0)

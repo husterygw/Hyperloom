@@ -87,7 +87,7 @@ Set with CLI flags, not env vars. Pre-set `ISL` / `OSL` / `CONC` / `PRECISION` /
   derived env values are session-owned and should not be set independently.
 - **Model / workload shape:** `--model`, `--model-class`, `--framework`,
   `--framework-version`, `--precision`, `--tp`, `--pp`, `--ep`, `--isl`, `--osl`,
-  `--conc`, `--num-prompts`, `--num-warmups`, `--max-model-len`, `--profile-osl`.
+  `--conc`, `--num-prompts`, `--num-warmups`, `--quality-suite`, `--max-model-len`, `--profile-osl`.
 - **Goal / budget:** `--target-gain`, `--target-roofline`, `--max-hours`,
   `--target-summary`, `--target-tput`, `--compare-against-gpu`. The roofline
   target composes with the others: whichever is met first ends the run.

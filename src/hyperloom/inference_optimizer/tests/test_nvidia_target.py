@@ -105,6 +105,8 @@ def test_cli_parses_target_and_pipeline_parallelism():
             "100",
             "--num-warmups",
             "0",
+            "--quality-suite",
+            "qwen3_p3",
         ]
     )
     assert args.target == NVIDIA_LOCAL_TARGET
@@ -112,6 +114,7 @@ def test_cli_parses_target_and_pipeline_parallelism():
     assert args.pp == 8
     assert args.num_prompts == 100
     assert args.num_warmups == 0
+    assert args.quality_suite == "qwen3_p3"
     with pytest.raises(SystemExit):
         _build_parser().parse_args(["optimize", "--model", "/models/qwen", "--pp", "0"])
 
@@ -233,13 +236,14 @@ def test_nvidia_host_validation_rejects_missing_required_vllm_cli_capability(mon
 
 def test_v6_state_migrates_target_and_pp_defaults():
     state = SharedState.from_dict({"schema_version": 6, "session_id": "old", "tp": 4})
-    assert state.schema_version == LATEST_STATE_SCHEMA_VERSION == 8
+    assert state.schema_version == LATEST_STATE_SCHEMA_VERSION == 9
     assert state.target_id == DEFAULT_TARGET
     assert state.target_capabilities == {}
     assert state.hardware_fingerprint == {}
     assert state.pp == 1
     assert state.num_prompts is None
     assert state.num_warmups is None
+    assert state.quality_suite == "smoke"
 
 
 def test_prompt_and_policy_filter_disabled_target_actions():

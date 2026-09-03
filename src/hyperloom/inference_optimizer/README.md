@@ -113,6 +113,12 @@ restored by `--resume-from`. This is the supported way to request a fixed
 sample size (for example, P3's 100 continuous requests); generic `--extra-env`
 does not retarget these workload-owned values.
 
+For Qwen3 P3 acceptance, add `--quality-suite qwen3_p3`. Alongside the usual
+smoke request it records the rendered prompts and non-empty responses for
+Chinese/English, short/long, and thinking/non-thinking cases in
+`quality_cases.json`. The suite uses the checkpoint's local tokenizer and the
+stable completions endpoint, so it does not depend on a particular vLLM version.
+
 ## Layout
 
 ```

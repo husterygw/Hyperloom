@@ -396,6 +396,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "When omitted, Hyperloom derives it from --conc.",
     )
     opt.add_argument(
+        "--quality-suite",
+        choices=("smoke", "qwen3_p3"),
+        default=None,
+        help="Serving quality contract. `smoke` verifies one non-empty completion; "
+        "`qwen3_p3` additionally records Chinese/English, short/long, and "
+        "thinking/non-thinking Qwen3 completions.",
+    )
+    opt.add_argument(
         "--max-model-len",
         dest="max_model_len",
         type=_positive_int_arg,

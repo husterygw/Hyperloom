@@ -34,6 +34,7 @@ _EXPORTED_WORKLOAD_ENVS = (
     "EP",
     "INFERENCE_OPTIMIZER_NUM_PROMPTS",
     "INFERENCE_OPTIMIZER_NUM_WARMUPS",
+    "INFERENCE_OPTIMIZER_QUALITY_SUITE",
 )
 
 
@@ -49,7 +50,7 @@ def _restore_exported_workload_envs():
 
 
 def _ns(**kwargs) -> argparse.Namespace:
-    defaults = {"conc": 64, "num_prompts": None, "num_warmups": None}
+    defaults = {"conc": 64, "num_prompts": None, "num_warmups": None, "quality_suite": "smoke"}
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
 
@@ -186,11 +187,15 @@ def test_multi_node_always_exports_workload_envs(monkeypatch):
 
 def test_explicit_request_counts_export_to_the_materializer(monkeypatch):
     """Public request-count flags use the trusted internal handoff, not --extra-env."""
-    for key in ("INFERENCE_OPTIMIZER_NUM_PROMPTS", "INFERENCE_OPTIMIZER_NUM_WARMUPS"):
+    for key in (
+        "INFERENCE_OPTIMIZER_NUM_PROMPTS",
+        "INFERENCE_OPTIMIZER_NUM_WARMUPS",
+        "INFERENCE_OPTIMIZER_QUALITY_SUITE",
+    ):
         monkeypatch.delenv(key, raising=False)
 
     _export_workload_envs_for_optimize(
-        _ns(conc=1, num_prompts=100, num_warmups=0),
+        _ns(conc=1, num_prompts=100, num_warmups=0, quality_suite="qwen3_p3"),
         nodes_resolved=1,
         tp_resolved=1,
         ep_resolved=1,
@@ -198,6 +203,7 @@ def test_explicit_request_counts_export_to_the_materializer(monkeypatch):
 
     assert os.environ["INFERENCE_OPTIMIZER_NUM_PROMPTS"] == "100"
     assert os.environ["INFERENCE_OPTIMIZER_NUM_WARMUPS"] == "0"
+    assert os.environ["INFERENCE_OPTIMIZER_QUALITY_SUITE"] == "qwen3_p3"
 
 
 def test_operator_server_args_env_routes_to_vllm_args(tmp_path, monkeypatch):

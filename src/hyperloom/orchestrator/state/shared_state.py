@@ -345,7 +345,7 @@ _KEY_METRIC_MAP: dict[str, tuple[str, str]] = {
 
 
 #: top-level state.json schema version; absent key treated as v1 and migrated to LATEST_STATE_SCHEMA_VERSION on first save.
-LATEST_STATE_SCHEMA_VERSION: int = 8
+LATEST_STATE_SCHEMA_VERSION: int = 9
 
 
 def effective_closing_grace_sec(
@@ -466,6 +466,9 @@ class SharedState(_RenderMixin, _ExploreStateMixin):
     # preserves the adaptive request-count policy; zero warmups is explicit.
     num_prompts: int | None = None
     num_warmups: int | None = None
+    # Semantic serving contract selected by --quality-suite. Kept separate from
+    # the benchmark shape so a bare resume repeats the same correctness gate.
+    quality_suite: str = "smoke"
     # Profile-phase output length (from --profile-osl). 0 = unset (profile
     # defaults to min(osl, 1024)). Persisted across resume.
     profile_osl: int = 0
@@ -1219,6 +1222,9 @@ class SharedState(_RenderMixin, _ExploreStateMixin):
         if incoming_version < 8:
             filtered.setdefault("num_prompts", None)
             filtered.setdefault("num_warmups", None)
+
+        if incoming_version < 9:
+            filtered.setdefault("quality_suite", "smoke")
 
         if isinstance(filtered.get("enablement"), dict):
             filtered["enablement"] = EnablementRound.from_dict(filtered["enablement"])

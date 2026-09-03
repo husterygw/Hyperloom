@@ -41,6 +41,9 @@ from . import bypass_engine, bypass_report
 
 SCHEMA_VERSION = "vllm_cuda_benchmark/v1"
 TARGET_ID = "nvidia_rtx4090_8x_local"
+QUALITY_SUITE_SMOKE = "smoke"
+QUALITY_SUITE_QWEN3_P3 = "qwen3_p3"
+_QUALITY_SUITES = frozenset({QUALITY_SUITE_SMOKE, QUALITY_SUITE_QWEN3_P3})
 
 # Config-only search surface. Unknown flags are rejected here; configured flags
 # are additionally checked against the vLLM CLI capabilities captured during
@@ -408,7 +411,157 @@ def _verify_model(base_url: str, served_model_name: str) -> None:
         raise RuntimeError(f"model identity mismatch: expected {served_model_name!r}, served={sorted(ids)!r}")
 
 
-def _quality_smoke(base_url: str, served_model_name: str) -> dict[str, Any]:
+def _completion_text(payload: dict[str, Any]) -> str:
+    """Extract one non-empty text completion from the OpenAI completions shape."""
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        return str(choices[0].get("text") or "").strip()
+    return ""
+
+
+def _qwen3_p3_cases() -> tuple[dict[str, Any], ...]:
+    """Return the small, deterministic semantic matrix required by NVIDIA P3."""
+    cn_context = "\n".join(
+        "背景资料：植物利用光能把二氧化碳和水转化为有机物，并释放氧气。"
+        for _ in range(12)
+    )
+    en_context = "\n".join(
+        "Background: photosynthesis uses light energy to convert water and carbon dioxide into sugars and oxygen."
+        for _ in range(12)
+    )
+    return (
+        {
+            "id": "cn_short_thinking",
+            "language": "zh",
+            "length": "short",
+            "enable_thinking": True,
+            "content": "请用一句中文说明光合作用的作用。",
+        },
+        {
+            "id": "en_short_no_thinking",
+            "language": "en",
+            "length": "short",
+            "enable_thinking": False,
+            "content": "Answer in one English sentence: what does photosynthesis do?",
+        },
+        {
+            "id": "cn_long_no_thinking",
+            "language": "zh",
+            "length": "long",
+            "enable_thinking": False,
+            "content": f"{cn_context}\n\n只用一句中文总结上述资料。",
+        },
+        {
+            "id": "en_long_thinking",
+            "language": "en",
+            "length": "long",
+            "enable_thinking": True,
+            "content": f"{en_context}\n\nGive a one-sentence English summary of the background.",
+        },
+    )
+
+
+def _qwen3_p3_quality_gate(
+    base_url: str,
+    served_model_name: str,
+    model: str,
+    *,
+    artifact_path: Path,
+) -> dict[str, Any]:
+    """Run and persist P3's Qwen3 semantic prompt matrix.
+
+    The tokenizer renders each prompt with its explicit thinking mode, then the
+    runner uses the stable `/v1/completions` endpoint. This keeps the API-side
+    contract independent of optional chat-completions payload keys that can
+    drift between vLLM releases.
+    """
+    config_path = Path(model).expanduser() / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"qwen3_p3 quality suite cannot read model config: {exc}") from exc
+    if str(config.get("model_type") or "").lower() != "qwen3":
+        raise RuntimeError("qwen3_p3 quality suite requires a Qwen3 checkpoint")
+    try:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+    except Exception as exc:  # noqa: BLE001 - surface the required local tokenizer evidence
+        raise RuntimeError(f"qwen3_p3 quality suite cannot load local tokenizer: {exc}") from exc
+
+    artifacts: list[dict[str, Any]] = []
+    summaries: list[dict[str, Any]] = []
+    for spec in _qwen3_p3_cases():
+        try:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": spec["content"]}],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=bool(spec["enable_thinking"]),
+            )
+            input_tokens = len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
+        except Exception as exc:  # noqa: BLE001 - template behavior is the subject under test
+            raise RuntimeError(f"qwen3_p3 could not render {spec['id']}: {exc}") from exc
+        if spec["length"] == "long" and input_tokens < 128:
+            raise RuntimeError(f"qwen3_p3 long case {spec['id']} rendered only {input_tokens} tokens")
+        payload = _json_request(
+            f"{base_url}/v1/completions",
+            payload={
+                "model": served_model_name,
+                "prompt": prompt,
+                "max_tokens": 32,
+                "temperature": 0,
+            },
+            timeout=90,
+        )
+        completion = _completion_text(payload)
+        if not completion:
+            raise RuntimeError(f"qwen3_p3 case {spec['id']} returned an empty completion")
+        metadata = {
+            "id": spec["id"],
+            "language": spec["language"],
+            "length": spec["length"],
+            "enable_thinking": bool(spec["enable_thinking"]),
+            "input_tokens": input_tokens,
+            "response_chars": len(completion),
+            "passed": True,
+        }
+        summaries.append(metadata)
+        artifacts.append(
+            {
+                **metadata,
+                "prompt": prompt,
+                "completion": completion,
+                "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                "completion_sha256": hashlib.sha256(completion.encode("utf-8")).hexdigest(),
+            }
+        )
+    _atomic_write_json(
+        artifact_path,
+        {
+            "schema_version": "vllm_cuda_quality/v1",
+            "suite": QUALITY_SUITE_QWEN3_P3,
+            "model": model,
+            "cases": artifacts,
+        },
+    )
+    return {
+        "passed": True,
+        "semantic_suite": QUALITY_SUITE_QWEN3_P3,
+        "semantic_case_count": len(summaries),
+        "semantic_cases": summaries,
+    }
+
+
+def _quality_smoke(
+    base_url: str,
+    served_model_name: str,
+    *,
+    model: str,
+    quality_suite: str,
+    artifact_path: Path,
+) -> dict[str, Any]:
+    """Run the baseline smoke request and an optional persisted semantic suite."""
     payload = _json_request(
         f"{base_url}/v1/completions",
         payload={
@@ -419,13 +572,36 @@ def _quality_smoke(base_url: str, served_model_name: str) -> dict[str, Any]:
         },
         timeout=60,
     )
-    choices = payload.get("choices")
-    text = ""
-    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-        text = str(choices[0].get("text") or "").strip()
+    text = _completion_text(payload)
     if not text:
         raise RuntimeError("quality smoke returned an empty completion")
-    return {"passed": True, "nonempty_completion": True, "sample_chars": len(text)}
+    smoke_artifact = {
+        "id": "smoke",
+        "prompt": "Reply with the word OK.",
+        "completion": text,
+        "response_chars": len(text),
+        "passed": True,
+    }
+    if quality_suite == QUALITY_SUITE_SMOKE:
+        _atomic_write_json(
+            artifact_path,
+            {"schema_version": "vllm_cuda_quality/v1", "suite": quality_suite, "cases": [smoke_artifact]},
+        )
+        return {"passed": True, "nonempty_completion": True, "sample_chars": len(text)}
+    if quality_suite == QUALITY_SUITE_QWEN3_P3:
+        semantic = _qwen3_p3_quality_gate(
+            base_url,
+            served_model_name,
+            model,
+            artifact_path=artifact_path,
+        )
+        persisted = read_json(artifact_path, default={}, require_dict=True, strict=True)
+        cases = persisted.get("cases") if isinstance(persisted, dict) else None
+        if isinstance(cases, list):
+            persisted["cases"] = [smoke_artifact, *cases]
+            _atomic_write_json(artifact_path, persisted)
+        return {"nonempty_completion": True, "sample_chars": len(text), **semantic}
+    raise ValueError(f"unsupported vLLM CUDA quality suite {quality_suite!r}")
 
 
 def _terminate_group(proc: subprocess.Popen[Any] | None, *, grace_s: float = 10.0) -> None:
@@ -597,6 +773,7 @@ def run_benchmark(config_path: Path, output_dir: Path) -> int:
     workspace = _workspace(output_dir)
     raw_path = workspace / "vllm_benchmark_raw.json"
     unified_path = workspace / "vllm_cuda_benchmark.json"
+    quality_cases_path = workspace / "quality_cases.json"
     server_log_path = workspace / "server.log"
     client_stdout_path = workspace / "client_stdout.log"
     client_stderr_path = workspace / "client_stderr.log"
@@ -606,6 +783,9 @@ def run_benchmark(config_path: Path, output_dir: Path) -> int:
     child_env["VLLM_PLUGINS"] = ""
     child_env.pop("ROCR_VISIBLE_DEVICES", None)
     child_env.pop("HIP_VISIBLE_DEVICES", None)
+    quality_suite = os.environ.get("INFERENCE_OPTIMIZER_QUALITY_SUITE", QUALITY_SUITE_SMOKE).strip()
+    if quality_suite not in _QUALITY_SUITES:
+        raise ValueError(f"unsupported vLLM CUDA quality suite {quality_suite!r}")
     server_argv = [
         sys.executable,
         "-m",
@@ -673,6 +853,7 @@ def run_benchmark(config_path: Path, output_dir: Path) -> int:
         "model": _model_fingerprint(model),
         "workload": _fingerprint({"isl": isl, "osl": osl, "conc": conc, "prompts": num_prompts}),
         "config": _fingerprint(cfg),
+        "quality_suite": _fingerprint(quality_suite),
     }
     plan = LaunchPlan(
         target_id=target_id,
@@ -699,6 +880,7 @@ def run_benchmark(config_path: Path, output_dir: Path) -> int:
             "server_log": str(server_log_path),
             "raw_result": str(raw_path),
             "unified_result": str(unified_path),
+            "quality_cases": str(quality_cases_path),
             "compatibility_report": str(workspace / "benchmark_report.json"),
         },
         fingerprints=fingerprints,
@@ -750,7 +932,13 @@ def run_benchmark(config_path: Path, output_dir: Path) -> int:
                     reason = "server_cuda_oom"
                 raise RuntimeError(reason)
         _verify_model(base_url, served_model_name)
-        quality_gate = _quality_smoke(base_url, served_model_name)
+        quality_gate = _quality_smoke(
+            base_url,
+            served_model_name,
+            model=model,
+            quality_suite=quality_suite,
+            artifact_path=quality_cases_path,
+        )
         with (
             client_stdout_path.open("w", encoding="utf-8") as stdout,
             client_stderr_path.open("w", encoding="utf-8") as stderr,

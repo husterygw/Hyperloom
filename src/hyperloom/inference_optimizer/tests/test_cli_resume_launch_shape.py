@@ -99,6 +99,7 @@ def test_launch_shape_survives_a_state_roundtrip():
         operator_extra_env={"SGLANG_USE_AITER": "0"},
         num_prompts=100,
         num_warmups=0,
+        quality_suite="qwen3_p3",
         nodes=4,
         robustness_options={"auto_probe_inference_server": False},
         warm_replay_enabled=False,
@@ -115,6 +116,7 @@ def test_launch_shape_survives_a_state_roundtrip():
     assert restored.operator_extra_env == {"SGLANG_USE_AITER": "0"}
     assert restored.num_prompts == 100
     assert restored.num_warmups == 0
+    assert restored.quality_suite == "qwen3_p3"
     assert restored.nodes == 4
     assert restored.robustness_options == {"auto_probe_inference_server": False}
     assert restored.warm_replay_enabled is False
@@ -133,6 +135,7 @@ def test_pre_existing_state_without_the_fields_loads_defaults():
     assert restored.operator_extra_env == {}
     assert restored.num_prompts is None
     assert restored.num_warmups is None
+    assert restored.quality_suite == "smoke"
     assert restored.nodes == 1
     assert restored.robustness_options == {}
     assert restored.warm_replay_enabled is True
