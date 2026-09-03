@@ -2349,7 +2349,7 @@ def _preflight(
             step_id="framework_deps",
             category="install",
             status="skipped",
-            skip_reason="pinned_vllm_wheel",
+            skip_reason="operator_managed_vllm_environment",
         )
     else:
         _run_install_step(

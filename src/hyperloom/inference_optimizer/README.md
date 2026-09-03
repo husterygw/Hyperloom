@@ -62,9 +62,13 @@ Cursor and Claw.
 ## Experimental NVIDIA/vLLM target
 
 The `nvidia_rtx4090_8x_local` target is the config-only CUDA MVP for the
-validated local host: exactly eight RTX 4090 GPUs (compute capability 8.9),
-CUDA 13.0 at `/usr/local/cuda-13.0`, and vLLM `0.27.0rc1`. It fails closed on
-hardware, wheel, compiler, session-resume, or `TP*PP` drift. It does not enter
+validated local host: exactly eight RTX 4090 GPUs (compute capability 8.9) and
+CUDA 13.0 at `/usr/local/cuda-13.0`. vLLM is operator-managed rather than
+version-pinned: preflight probes the selected interpreter's `vllm serve` and
+`vllm bench serve` CLI, then fails closed only when it lacks the runner's
+required capabilities. The actual version and CLI surface are recorded in the
+session hardware fingerprint. It also fails closed on hardware, compiler,
+session-resume, or `TP*PP` drift. It does not enter
 the ROCm/Magpie/InferenceX/TraceLens/GEAK/Quark paths.
 
 ```bash

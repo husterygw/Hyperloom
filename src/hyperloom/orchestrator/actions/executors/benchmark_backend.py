@@ -137,7 +137,7 @@ class VllmCudaBackend:
     name = "vllm_cuda"
 
     def resolve_interpreter(self) -> str:
-        """Use the exact environment that imports the pinned vLLM wheel."""
+        """Use the exact environment that imports the capability-validated vLLM CLI."""
         import sys
 
         return sys.executable

@@ -169,24 +169,50 @@ def test_hardware_fingerprint_is_deterministic(monkeypatch):
     assert first["devices"][4]["numa_node"] == 1
 
 
-def test_nvidia_host_validation_records_pinned_stack(monkeypatch):
+def test_nvidia_host_validation_records_capability_validated_stack(monkeypatch):
     import torch
     from hyperloom.inference_optimizer import target_registry as registry
 
     monkeypatch.setattr(registry, "discover_nvidia_devices", lambda: tuple(_device(i) for i in range(8)))
     monkeypatch.setattr(registry, "_nvcc_release", lambda path: "Cuda compilation tools, release 13.0")
     monkeypatch.setattr(registry, "_nvidia_driver_version", lambda: "590.48.01")
-    monkeypatch.setattr(registry.importlib.metadata, "version", lambda name: "0.27.0rc1" if name == "vllm" else "")
+    monkeypatch.setattr(registry.importlib.metadata, "version", lambda name: "0.28.0" if name == "vllm" else "")
+    monkeypatch.setattr(
+        registry,
+        "_probe_vllm_cli_flags",
+        lambda *subcommand: set(
+            registry.VLLM_CUDA_REQUIRED_SERVER_FLAGS
+            if subcommand == ("serve",)
+            else registry.VLLM_CUDA_REQUIRED_BENCH_FLAGS
+        ),
+    )
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
     monkeypatch.delenv("CUDA_HOME", raising=False)
     fingerprint = validate_nvidia_host(get_target(NVIDIA_LOCAL_TARGET))
     assert fingerprint["target_id"] == NVIDIA_LOCAL_TARGET
     assert fingerprint["cuda_home"] == "/usr/local/cuda-13.0"
-    assert fingerprint["vllm_version"] == "0.27.0rc1"
+    assert fingerprint["vllm_version"] == "0.28.0"
+    assert fingerprint["vllm_cli"]["server_flags"] == sorted(registry.VLLM_CUDA_REQUIRED_SERVER_FLAGS)
+    assert fingerprint["vllm_cli"]["bench_flags"] == sorted(registry.VLLM_CUDA_REQUIRED_BENCH_FLAGS)
     assert fingerprint["driver_version"] == "590.48.01"
     assert fingerprint["torch_cuda_version"]
     assert fingerprint["nccl_version"]
+
+
+def test_nvidia_host_validation_rejects_missing_required_vllm_cli_capability(monkeypatch):
+    import torch
+    from hyperloom.inference_optimizer import target_registry as registry
+
+    monkeypatch.setattr(registry, "discover_nvidia_devices", lambda: tuple(_device(i) for i in range(8)))
+    monkeypatch.setattr(registry, "_nvcc_release", lambda path: "Cuda compilation tools, release 13.0")
+    monkeypatch.setattr(registry.importlib.metadata, "version", lambda name: "99.0.0" if name == "vllm" else "")
+    monkeypatch.setattr(registry, "_probe_vllm_cli_flags", lambda *subcommand: {"--host"})
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
+
+    with pytest.raises(TargetValidationError, match="missing required flag"):
+        validate_nvidia_host(get_target(NVIDIA_LOCAL_TARGET))
 
 
 def test_v6_state_migrates_target_and_pp_defaults():

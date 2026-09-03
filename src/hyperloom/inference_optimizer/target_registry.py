@@ -14,7 +14,9 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import re
 import subprocess
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -58,7 +60,8 @@ class TargetDescriptor:
     expected_gpu_count: int = 0
     expected_compute_capability: str = ""
     min_memory_mib: int = 0
-    required_vllm_version: str = ""
+    required_vllm_server_flags: tuple[str, ...] = ()
+    required_vllm_bench_flags: tuple[str, ...] = ()
     default_cuda_home: str = ""
     experimental: bool = False
 
@@ -89,6 +92,39 @@ _NVIDIA_MVP = TargetCapabilities(
     multinode=False,
 )
 
+# The CUDA runner owns these flags and cannot operate safely without them.
+# Compatibility is determined by the installed CLI surface, not by an exact
+# vLLM package version: vLLM releases can advance while retaining this contract.
+VLLM_CUDA_REQUIRED_SERVER_FLAGS = (
+    "--host",
+    "--port",
+    "--served-model-name",
+    "--tensor-parallel-size",
+    "--pipeline-parallel-size",
+    "--max-model-len",
+)
+VLLM_CUDA_REQUIRED_BENCH_FLAGS = (
+    "--backend",
+    "--base-url",
+    "--endpoint",
+    "--model",
+    "--tokenizer",
+    "--dataset-name",
+    "--random-input-len",
+    "--random-output-len",
+    "--num-prompts",
+    "--num-warmups",
+    "--max-concurrency",
+    "--request-rate",
+    "--ignore-eos",
+    "--percentile-metrics",
+    "--metric-percentiles",
+    "--save-result",
+    "--result-dir",
+    "--result-filename",
+    "--disable-tqdm",
+)
+
 _TARGETS: dict[str, TargetDescriptor] = {
     DEFAULT_TARGET: TargetDescriptor(
         target_id=DEFAULT_TARGET,
@@ -107,7 +143,8 @@ _TARGETS: dict[str, TargetDescriptor] = {
         expected_gpu_count=8,
         expected_compute_capability="8.9",
         min_memory_mib=24000,
-        required_vllm_version="0.27.0rc1",
+        required_vllm_server_flags=VLLM_CUDA_REQUIRED_SERVER_FLAGS,
+        required_vllm_bench_flags=VLLM_CUDA_REQUIRED_BENCH_FLAGS,
         default_cuda_home="/usr/local/cuda-13.0",
         experimental=True,
     ),
@@ -283,6 +320,47 @@ def _nvcc_release(cuda_home: Path) -> str:
     return text.strip().splitlines()[-1] if text.strip() else "CUDA 13.0"
 
 
+def _probe_vllm_cli_flags(*subcommand: str) -> set[str]:
+    """Return long options exposed by one installed vLLM CLI command.
+
+    Recent vLLM releases group most serving flags by config class, so the
+    probe uses ``--help=all``. It runs through ``sys.executable`` to verify the
+    exact interpreter that will launch the CUDA runner.
+    """
+    command = [sys.executable, "-m", "vllm.entrypoints.cli.main", *subcommand, "--help=all"]
+    try:
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=90, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        rendered = " ".join(command)
+        raise TargetValidationError(f"cannot probe vLLM CLI ({rendered}): {exc}") from exc
+    output = f"{proc.stdout}\n{proc.stderr}"
+    if proc.returncode != 0:
+        detail = output.strip()[-1000:]
+        raise TargetValidationError(
+            f"vLLM CLI probe failed for {' '.join(subcommand)} (rc={proc.returncode}): {detail}"
+        )
+    flags = set(re.findall(r"(?<![A-Za-z0-9_-])(--[a-z0-9][a-z0-9-]*)", output))
+    if not flags:
+        raise TargetValidationError(f"vLLM CLI probe returned no long options for {' '.join(subcommand)}")
+    return flags
+
+
+def _validate_vllm_cli(target: TargetDescriptor) -> dict[str, list[str]]:
+    """Verify the command surface required by the native CUDA runner."""
+    server_flags = _probe_vllm_cli_flags("serve")
+    bench_flags = _probe_vllm_cli_flags("bench", "serve")
+    missing_server = sorted(set(target.required_vllm_server_flags) - server_flags)
+    missing_bench = sorted(set(target.required_vllm_bench_flags) - bench_flags)
+    errors: list[str] = []
+    if missing_server:
+        errors.append("vLLM serve is missing required flag(s): " + ", ".join(missing_server))
+    if missing_bench:
+        errors.append("vLLM bench serve is missing required flag(s): " + ", ".join(missing_bench))
+    if errors:
+        raise TargetValidationError("; ".join(errors))
+    return {"server_flags": sorted(server_flags), "bench_flags": sorted(bench_flags)}
+
+
 def validate_nvidia_host(target: TargetDescriptor) -> dict[str, Any]:
     """Fail closed unless the current interpreter and host match ``target``."""
     if target.runtime != "cuda":
@@ -325,8 +403,14 @@ def validate_nvidia_host(target: TargetDescriptor) -> dict[str, Any]:
         vllm_version = importlib.metadata.version("vllm")
     except importlib.metadata.PackageNotFoundError:
         vllm_version = ""
-    if vllm_version != target.required_vllm_version:
-        errors.append(f"vLLM version is {vllm_version or '<missing>'}, expected {target.required_vllm_version}")
+    vllm_cli: dict[str, list[str]] = {}
+    if not vllm_version:
+        errors.append("vLLM is not installed in the selected interpreter")
+    else:
+        try:
+            vllm_cli = _validate_vllm_cli(target)
+        except TargetValidationError as exc:
+            errors.append(str(exc))
 
     explicit_cuda_home = str(os.environ.get("CUDA_HOME") or "").strip()
     cuda_home = Path(explicit_cuda_home or target.default_cuda_home).expanduser().resolve()
@@ -342,6 +426,7 @@ def validate_nvidia_host(target: TargetDescriptor) -> dict[str, Any]:
     fingerprint["cuda_home"] = str(cuda_home)
     fingerprint["nvcc"] = nvcc_version
     fingerprint["vllm_version"] = vllm_version
+    fingerprint["vllm_cli"] = vllm_cli
     fingerprint["driver_version"] = _nvidia_driver_version()
     fingerprint["torch_version"] = torch_version
     fingerprint["torch_cuda_version"] = torch_cuda_version
@@ -416,6 +501,8 @@ __all__ = [
     "TargetCapabilities",
     "TargetDescriptor",
     "TargetValidationError",
+    "VLLM_CUDA_REQUIRED_BENCH_FLAGS",
+    "VLLM_CUDA_REQUIRED_SERVER_FLAGS",
     "build_hardware_fingerprint",
     "configure_target_environment",
     "discover_nvidia_devices",

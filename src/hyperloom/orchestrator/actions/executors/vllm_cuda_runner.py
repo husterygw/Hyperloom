@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""Native single-node CUDA benchmark runner for the pinned vLLM wheel.
+"""Native single-node CUDA benchmark runner for a capability-validated vLLM CLI.
 
 The runner consumes the same materialized YAML and writes the same
 ``benchmark_report.json`` surface as Magpie while also emitting the richer
@@ -41,9 +41,9 @@ from . import bypass_engine, bypass_report
 SCHEMA_VERSION = "vllm_cuda_benchmark/v1"
 TARGET_ID = "nvidia_rtx4090_8x_local"
 
-# Config-only search surface validated against the pinned vLLM CLI. Unknown
-# flags are rejected here instead of being forwarded to an environment whose
-# parser may change across versions.
+# Config-only search surface. Unknown flags are rejected here; configured flags
+# are additionally checked against the vLLM CLI capabilities captured during
+# target preflight before they are forwarded to a newer vLLM release.
 SUPPORTED_EXTRA_VLLM_FLAGS = frozenset(
     {
         "--async-scheduling",
@@ -194,6 +194,16 @@ def _tokenize_extra_args(envs: dict[str, Any]) -> list[str]:
             raise ValueError(f"EXTRA_VLLM_ARGS may not override runner-owned flag {flag}")
         if flag.startswith("--") and flag not in SUPPORTED_EXTRA_VLLM_FLAGS:
             raise ValueError(f"EXTRA_VLLM_ARGS contains unsupported flag {flag}")
+    cli_capabilities = _hardware_payload().get("vllm_cli")
+    available = cli_capabilities.get("server_flags") if isinstance(cli_capabilities, dict) else None
+    if isinstance(available, list):
+        available_flags = {str(flag) for flag in available}
+        missing = sorted({token.split("=", 1)[0] for token in tokens if token.startswith("--")} - available_flags)
+        if missing:
+            raise ValueError(
+                "EXTRA_VLLM_ARGS contains flag(s) not supported by the installed vLLM CLI: "
+                + ", ".join(missing)
+            )
     return tokens
 
 
@@ -428,7 +438,7 @@ def normalize_vllm_result(
     cleanup_status: str,
     failure_reason: str = "",
 ) -> dict[str, Any]:
-    """Normalize vLLM 0.27 bench JSON into the stable CUDA schema."""
+    """Normalize a capability-validated vLLM bench JSON into the stable CUDA schema."""
     world_size = int(plan.topology["world_size"])
     total_output = _float(raw.get("output_throughput"))
     completed = _int(raw.get("completed"), _int(raw.get("completed_requests"), 0))
