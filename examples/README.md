@@ -1,5 +1,11 @@
 # Hyperloom Quickstart
 
+For the experimental local **NVIDIA CUDA/vLLM** target, use the
+[Qwen3-8B NVIDIA 3-hour example](hyperloom-qwen3-8b-nvidia-3h/SKILL.md).
+It includes a source-checkout launcher for config-only optimization on one
+leased GPU of the validated eight-RTX-4090 host. The setup instructions below
+describe the original AMD/ROCm demos.
+
 Follow this quickstart guide to get started using Hyperloom. For more detailed
 installation instructions, see the
 [Hyperloom ROCm Docs](https://rocm.docs.amd.com/projects/hyperloom/en/latest/)
