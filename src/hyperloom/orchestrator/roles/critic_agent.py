@@ -11,6 +11,8 @@ import logging
 import os
 import re
 import time
+from hyperloom.common.codex_session import codex_cli_auth_requested, run_codex_turn
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -444,6 +446,8 @@ class CriticAgentBackend:
         )
         if self.protocol == "anthropic":
             self._require_anthropic_transport()
+        elif codex_cli_auth_requested() and self.codex_client_factory is None:
+            self._client = None  # Review uses the same private SDK credential lifecycle as orchestration.
         elif self.codex_client_factory is not None:
             self._client = self.codex_client_factory()
         else:
@@ -1065,21 +1069,38 @@ class CriticAgentBackend:
         usage_acc = {"input_tokens": 0, "output_tokens": 0}
         _t0 = time.perf_counter()
         try:
-            result = await achat_completion(
-                self._client,
-                component="critic",
-                operation="review",
-                **kwargs,
-            )
+            if self._client is None and codex_cli_auth_requested():
+                _, timeout_s = self._resolve_llm_timeouts()
+                result = await run_codex_turn(
+                    cwd=self.session_dir,
+                    model=self._review_model,
+                    developer_instructions=system_prompt or "",
+                    prompt=user_prompt,
+                    timeout_sec=timeout_s,
+                    component="critic",
+                    operation="review",
+                )
+                if result.error:
+                    raise BackendError(result.error)
+            else:
+                result = await achat_completion(
+                    self._client,
+                    component="critic",
+                    operation="review",
+                    **kwargs,
+                )
         except Exception as exc:  # noqa: BLE001
             raise self._llm_call_failed(
                 f"Codex API call failed (critic-agent reasoning): {exc!r}",
                 latency_ms=int((time.perf_counter() - _t0) * 1000),
             ) from exc
         latency_ms = int((time.perf_counter() - _t0) * 1000)
-        self._accumulate_usage(usage_acc, result.usage)
+        if isinstance(result.usage, dict):
+            usage_acc.update({key: int(result.usage.get(key, 0) or 0) for key in usage_acc})
+        else:
+            self._accumulate_usage(usage_acc, result.usage)
         self._trace_critic_llm_call(usage_acc, latency_ms=latency_ms, call_id=call_id)
-        return result.text, result.finish_reason
+        return result.text, getattr(result, "finish_reason", "stop")
 
     async def _run_anthropic_reasoning(
         self,

@@ -2176,3 +2176,34 @@ async def test_anthropic_protocol_traces_cache_counters_separately(
     assert row["cache_read_input_tokens"] == 4000
     assert row["cache_creation_input_tokens"] == 300
     assert row["output_tokens"] == 500
+
+
+@pytest.mark.asyncio
+async def test_critic_cli_auth_uses_private_codex_session_without_api_key(
+    monkeypatch,
+    fake_critic_root,
+    fake_session_dir,
+):
+    from hyperloom.orchestrator.roles import critic_agent as module
+    from hyperloom.common.codex_session import CodexSessionResult
+
+    monkeypatch.setenv("HYPERLOOM_CODEX_CLI_AUTH", "1")
+    for name in ("OPENAI_API_KEY", "LLM_GATEWAY_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(module, "get_async_openai_client", lambda **kw: pytest.fail("API client used for CLI auth"))
+    calls = []
+
+    async def run(**kwargs):
+        calls.append(kwargs)
+        return CodexSessionResult(text='{"review_verdicts": []}', usage={"input_tokens": 20, "output_tokens": 5})
+
+    monkeypatch.setattr(module, "run_codex_turn", run)
+    backend = CriticAgentBackend(critic_agent_root=fake_critic_root, session_dir=fake_session_dir)
+    reply, finish = await backend._run_openai_reasoning(
+        system_prompt="Review only", user_prompt="bundle", max_tokens=100
+    )
+    assert json.loads(reply) == {"review_verdicts": []}
+    assert finish == "stop"
+    assert calls[0]["cwd"] == fake_session_dir
+    assert calls[0]["developer_instructions"] == "Review only"
+    assert calls[0]["component"] == "critic"
