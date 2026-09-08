@@ -64,9 +64,7 @@ def test_nv_profile_is_opt_in_and_cannot_enable_roofline(level):
         gate._validate_target_capability("profile")
 
 
-@pytest.mark.parametrize(
-    "kwargs", [{"optimization_level": "source"}, {"optimization_level": "kernel"}, {"profile_backend": "nsys"}]
-)
+@pytest.mark.parametrize("kwargs", [{"optimization_level": "source"}, {"optimization_level": "kernel"}])
 def test_unimplemented_features_fail_before_gpu_launch(kwargs):
     with pytest.raises(TargetValidationError, match="not implemented"):
         validate_target_arguments(SimpleNamespace(**kwargs), get_target(NVIDIA_LOCAL_TARGET))
@@ -138,6 +136,7 @@ def test_profile_runner_validates_artifact_and_releases_gpu(tmp_path, monkeypatc
             return None
 
     monkeypatch.setattr(runner.subprocess, "Popen", AliveServer)
+    monkeypatch.setattr(runner.os, "getpgid", lambda pid: pid)
     terminated = []
     monkeypatch.setattr(runner, "_terminate_group", lambda proc: terminated.append(proc))
     import urllib.request

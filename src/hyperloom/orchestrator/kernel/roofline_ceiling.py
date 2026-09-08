@@ -1038,7 +1038,23 @@ def compute_roofline_breakdown_from_state(
     *,
     arm: str | None = None,
 ) -> RooflineBreakdown:
-    """Primary decode ceiling + T_mem/T_cmp side projections."""
+    """Primary decode ceiling + T_mem/T_cmp side projections.
+
+    Prefers the bottom-up PerfModel (``compute_roofline_from_perfmodel``) when
+    the model config is complete, else the legacy top-down aggregate. Never
+    raises; returns ``_EMPTY_BREAKDOWN`` on missing fields. ``arm`` pins
+    precision to a specific arm.
+
+    Args:
+        state: Shared run state to resolve the workload and dtype from.
+        arm: Pins precision to a specific arm; ``None`` infers it.
+
+    Returns:
+        The decode ``RooflineBreakdown`` (``_EMPTY_BREAKDOWN`` on missing
+        fields).
+    """
+    if getattr(state, "target_id", "") == "nvidia_rtx4090_8x_local":
+        return _EMPTY_BREAKDOWN  # Selected NCU kernels do not establish an end-to-end ceiling.
     runtime = resolve_runtime_workload(state, arm=arm)
     # Diffusion (xDiT) uses a distinct images/sec ceiling.
     if (runtime.framework or "").strip().lower() == "xdit":

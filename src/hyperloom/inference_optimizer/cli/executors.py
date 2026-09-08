@@ -297,10 +297,13 @@ def _register_executors(
 
     # roofline (profile + trace_analyze): auto-enqueued at PRELUDE + each 10%
     # watermark crossing, so always registered.
-    coordinator.sub.register_executor(
-        "roofline",
-        make_roofline_executor(shared_state=coordinator.shared_state),
-    )
+    if getattr(coordinator.shared_state, "target_id", "amd_auto") == "nvidia_rtx4090_8x_local":
+        from hyperloom.orchestrator.actions.executors.cuda_roofline import CudaRooflineExecutor
+
+        roofline_executor = CudaRooflineExecutor(shared_state=coordinator.shared_state, session_dir=session_dir)
+    else:
+        roofline_executor = make_roofline_executor(shared_state=coordinator.shared_state)
+    coordinator.sub.register_executor("roofline", roofline_executor)
 
     # targeted_build: off-loop compiled-component builds.  Coordinator-internal
     # only (in INTERNAL_ONLY_ACTION_NAMES); dispatched by the enablement phase,

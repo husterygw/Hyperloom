@@ -469,23 +469,37 @@ def configure_target_environment(
         os.environ[HARDWARE_FINGERPRINT_ENV] = json.dumps(dict(fingerprint), sort_keys=True)
 
 
-def effective_target_capabilities(target: TargetDescriptor, level: str = "config") -> dict[str, bool]:
+def effective_target_capabilities(
+    target: TargetDescriptor, level: str = "config", backend: str = "torch", *, roofline: bool = True
+) -> dict[str, bool]:
     """Grant only implemented, explicitly selected features for a new session."""
     capabilities = target.capabilities.to_dict()
     if target.runtime == "cuda":
         if level not in ("config", "profile"):
             raise TargetValidationError(f"NVIDIA optimization level {level!r} is not implemented")
         capabilities["profile"] = level == "profile"
+        capabilities["trace_analysis"] = level == "profile" and backend == "nsys"
+        capabilities["roofline"] = capabilities["trace_analysis"] and roofline
     return capabilities
 
 
-def validate_profile_runtime(fingerprint: Mapping[str, Any]) -> None:
+def validate_profile_runtime(
+    fingerprint: Mapping[str, Any], *, backend: str = "torch", roofline: bool = False
+) -> dict[str, Any]:
     """Check installed vLLM's native torch profiling command surface."""
     surface = fingerprint.get("vllm_cli", {})
     if "--profiler-config" not in surface.get("server_flags", []):
         raise TargetValidationError("NVIDIA profiling requires vLLM serve --profiler-config")
     if "--profile" not in surface.get("bench_flags", []):
         raise TargetValidationError("NVIDIA profiling requires vLLM bench serve --profile")
+    if backend == "nsys":
+        from hyperloom.orchestrator.actions.executors.cuda_nsight import tool_fingerprint
+
+        try:
+            return tool_fingerprint(roofline=roofline)
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            raise TargetValidationError(f"Nsight preflight failed: {exc}") from exc
+    return {}
 
 
 def validate_target_arguments(args: Any, target: TargetDescriptor) -> None:
@@ -498,9 +512,13 @@ def validate_target_arguments(args: Any, target: TargetDescriptor) -> None:
         return
     args.optimization_level = level or "config"
     args.profile_backend = backend or "torch"
-    args.target_capabilities = effective_target_capabilities(target, args.optimization_level)
-    if args.profile_backend != "torch":
-        raise TargetValidationError("NVIDIA nsys profiling is not implemented; use --profile-backend torch")
+    if args.profile_backend not in ("torch", "nsys"):
+        raise TargetValidationError("unsupported NVIDIA profile backend")
+    if args.profile_backend == "nsys" and args.optimization_level != "profile":
+        raise TargetValidationError("NVIDIA nsys requires --optimization-level profile")
+    args.target_capabilities = effective_target_capabilities(
+        target, args.optimization_level, args.profile_backend, roofline=getattr(args, "enable_roofline", True)
+    )
     if int(getattr(args, "nodes", 1) or 1) != 1:
         raise TargetValidationError(f"target {target.target_id} is single-node only")
     framework = str(getattr(args, "framework", None) or "").strip().lower()
@@ -513,7 +531,7 @@ def validate_target_arguments(args: Any, target: TargetDescriptor) -> None:
 
     args.framework = "vllm"
     args.no_kernel = True
-    args.enable_roofline = False
+    args.enable_roofline = args.target_capabilities["roofline"]
     # Keep OPTIMIZE enabled for config exploration. The source arm is marked
     # exhausted in SharedState and PolicyGate denies patch-capable actions.
     args.no_framework_agent = False

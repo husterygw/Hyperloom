@@ -273,11 +273,29 @@ def _pid_cmdline(pid: int) -> str:
 
 
 def _looks_like_server_process(pid: int) -> bool:
-    """Return whether ``pid``'s cmdline matches a Hyperloom serving process."""
-    cmdline = _pid_cmdline(pid)
-    if not cmdline:
-        return False
-    return any(marker in cmdline for marker in _SERVER_CMDLINE_MARKERS)
+    """Return whether ``pid``'s cmdline matches a Hyperloom serving process.
+
+    Guards against pid reuse: only a live pid whose cmdline contains a known
+    serving marker is treated as a reapable orphan.
+
+    Args:
+        pid: The candidate process id.
+
+    Returns:
+        ``True`` when the pid's cmdline names a Hyperloom-spawned server.
+    """
+    # /proc/cmdline can briefly be empty during exec, after a launcher has
+    # already published its ownership record. Retry that transition only;
+    # a nonempty unrelated command line is still an immediate refusal.
+    for attempt in range(5):
+        cmdline = _pid_cmdline(pid)
+        if cmdline:
+            return any(marker in cmdline for marker in _SERVER_CMDLINE_MARKERS)
+        if not _pid_alive_simple(pid):
+            break
+        if attempt < 4:
+            time.sleep(0.02)
+    return False
 
 
 def _process_group_looks_like_server(pgid: int) -> bool:

@@ -291,7 +291,8 @@ ACTION_CATALOGUE: Mapping[str, ActionMetadata] = MappingProxyType(
             requires_lanes=("profile_lane",),
             side_effects=("reads_server", "writes_results"),
             description=(
-                "Coordinator-internal: lightweight roofline alternative — torch_profiler trace only, no analysis.md. "
+                "Coordinator-internal: capture a profile without hardware counters. Torch produces a trace; "
+                "NVIDIA Nsight Systems also produces deterministic timeline analysis.md. "
                 "Enqueued when ``--no-enable-roofline``; LLM-proposed delegate is denied."
             ),
         ),
@@ -358,8 +359,9 @@ ACTION_CATALOGUE: Mapping[str, ActionMetadata] = MappingProxyType(
             requires_lanes=("profile_lane",),
             side_effects=("reads_server", "writes_results"),
             description=(
-                "Composite action: runs profile + trace_analyze atomically to produce a fresh TraceLens analysis.md "
-                "snapshot. Required prerequisite for explore."
+                "Composite action: produces a fresh analysis.md snapshot using the target backend. "
+                "AMD uses profile + TraceLens; NVIDIA uses Nsight Systems plus selected-kernel Nsight Compute "
+                "counters. Source/kernel actions still require their separate target capabilities."
             ),
         ),
         "session_breakdown": ActionMetadata(

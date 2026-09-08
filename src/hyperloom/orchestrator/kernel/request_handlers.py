@@ -5331,6 +5331,29 @@ async def trace_analyze_handler(
     trace_input = payload.get("trace_input") or payload.get("trace_dir")
     if not trace_input:
         return {"status": "failed", "error": "missing 'trace_input' in payload"}
+    from ..state.shared_state import SharedState
+
+    cuda_state = SharedState.load_or_init(session_dir)
+    if cuda_state.target_id == "nvidia_rtx4090_8x_local":
+        if cuda_state.profile_backend != "nsys" or not cuda_state.target_capabilities.get("trace_analysis"):
+            return {"status": "failed", "error": "NVIDIA trace analysis requires the nsys backend"}
+        trace = Path(trace_input).resolve()
+        if not trace.is_relative_to(session_dir.resolve()) or str(trace) != str(
+            Path(cuda_state.last_profile_trace).resolve()
+        ):
+            return {"status": "failed", "error": "trace must be the current session's validated NVIDIA profile"}
+        from ..actions.executors.cuda_nsight import write_analysis
+
+        try:
+            manifest = json.loads((trace.parent / "vllm_cuda_profile.json").read_text())
+            if manifest.get("backend") != "nsys" or manifest.get("status") != "succeeded":
+                raise ValueError("invalid Nsight profile manifest")
+            summary = json.loads((trace.parent / "nsight_summary.json").read_text())
+            if summary.get("fingerprints") != manifest.get("fingerprints"):
+                raise ValueError("Nsight analysis fingerprint mismatch")
+            return write_analysis(trace.parent, summary)
+        except (OSError, ValueError) as exc:
+            return {"status": "failed", "error": str(exc)}
     root_err = _kernel_agent_root_error()
     if root_err:
         return {"status": "failed", "error_class": "kernel_agent_root_missing", "error": root_err}

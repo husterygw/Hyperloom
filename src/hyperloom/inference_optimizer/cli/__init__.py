@@ -1575,10 +1575,21 @@ async def _run_optimize(args: argparse.Namespace) -> int:
                         f"resume {field} conflict: session={saved!r}, requested={requested!r}; start a new session"
                     )
                 setattr(args, field, saved)
+            if (
+                getattr(args, "enable_roofline_explicit", False)
+                and args.enable_roofline != _early_state.enable_roofline
+            ):
+                raise TargetValidationError("resume enable_roofline conflict; start a new session")
+            args.enable_roofline = _early_state.enable_roofline
         validate_target_arguments(args, target)
         hardware_fingerprint = validate_nvidia_host(target) if target.runtime == "cuda" else {}
         if target.runtime == "cuda" and args.optimization_level == "profile":
-            validate_profile_runtime(hardware_fingerprint)
+            args.profile_tool_fingerprint = validate_profile_runtime(
+                hardware_fingerprint, backend=args.profile_backend, roofline=args.enable_roofline
+            )
+            saved_tools = getattr(_early_state, "profile_tool_fingerprint", {}) if _early_state else {}
+            if saved_tools and saved_tools != args.profile_tool_fingerprint:
+                raise TargetValidationError("Nsight tool fingerprint changed; start a new session")
         if persisted_hardware and hardware_fingerprint:
             if persisted_hardware.get("sha256") != hardware_fingerprint.get("sha256"):
                 raise TargetValidationError(

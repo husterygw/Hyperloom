@@ -27,7 +27,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -868,7 +868,12 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
     num_warmups = max(0, _int(envs.get("NUM_WARMUPS"), 1))
     max_model_len = max(isl + osl, _int(envs.get("MAX_MODEL_LEN"), isl + osl + 32))
     timeout_s = max(60, _int(bench.get("timeout_seconds"), 3600))
-    profile_enabled = bool(((bench.get("profiler") or {}).get("torch_profiler") or {}).get("enabled"))
+    cuda_profiler = (bench.get("profiler") or {}).get("cuda_profiler") or {}
+    profile_backend = str(cuda_profiler.get("backend") or "torch")
+    external_profile = profile_backend in ("nsys", "ncu")
+    profile_enabled = external_profile or bool(
+        ((bench.get("profiler") or {}).get("torch_profiler") or {}).get("enabled")
+    )
     if profile_enabled and num_prompts > 16:
         raise ValueError("CUDA profiling is limited to 16 requests per trace window")
     lifecycle = bench.get("server_lifecycle") or {}
@@ -970,9 +975,25 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
             "torch_profiler_record_shapes": True,
             "torch_profiler_dump_cuda_time_total": False,
         }
+        if external_profile:
+            profiler_config = {"profiler": "cuda", "detailed_trace_annotation": True}
+            if profile_backend == "ncu":
+                profiler_config["max_iterations"] = int(cuda_profiler.get("max_iterations", 4))
+                profiler_config["delay_iterations"] = int(cuda_profiler.get("delay_iterations", 0))
         server_argv.extend(["--profiler-config", json.dumps(profiler_config)])
         benchmark_argv.append("--profile")
+    serving_args = []
+    skip_value = False
+    for value in server_argv:
+        if skip_value:
+            skip_value = False
+            continue
+        if value in ("--port", "--served-model-name", "--profiler-config"):
+            skip_value = True
+            continue
+        serving_args.append(value)
     fingerprints = {
+        "serving_config": _fingerprint({"argv": serving_args, "envs": {k: v for k, v in envs.items() if k != "PORT"}}),
         "hardware": str(hardware_payload["sha256"]),
         "model": _model_fingerprint(model),
         "workload": _fingerprint({"isl": isl, "osl": osl, "conc": conc, "prompts": num_prompts}),
@@ -1009,6 +1030,27 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
         },
         fingerprints=fingerprints,
     )
+    if external_profile:
+        from .cuda_nsight import profiler_argv, tool_fingerprint
+
+        fingerprints["profiler_tools"] = tool_fingerprint(
+            roofline=profile_backend == "ncu", expected=cuda_profiler.get("tools")
+        )
+        # The launcher publishes the actual serving PID/group before exec.
+        server_argv = profiler_argv(
+            profile_backend,
+            [
+                sys.executable,
+                "-m",
+                "hyperloom.orchestrator.actions.executors.cuda_profiler_launch",
+                str(workspace / "serving_ownership.json"),
+                *server_argv,
+            ],
+            workspace,
+            str(cuda_profiler.get("kernel_name") or ""),
+            tool_paths=fingerprints["profiler_tools"],
+        )
+        plan = replace(plan, server_argv=server_argv)
     _atomic_write_json(workspace / "launch_plan.json", asdict(plan))
     (workspace / "benchmark_config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
 
@@ -1022,6 +1064,22 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
         stable_key=stable_key,
         ttl_sec=ready_timeout_s + timeout_s + 600,
     )
+    ownership_metadata = {
+        "gpu_lease_holder": lease.holder_id,
+        "gpu_lease_task": lease.task_id,
+        "gpu_indices": list(lease.gpu_ids),
+        "gpu_uuids": list(lease.gpu_uuids),
+    }
+    if external_profile:
+        _atomic_write_json(
+            workspace / "serving_ownership.json",
+            {
+                "pid_dir": str(workspace / "serving"),
+                "port": port,
+                "model": served_model_name,
+                "metadata": ownership_metadata,
+            },
+        )
     start = time.time()
     server_proc: subprocess.Popen[Any] | None = None
     server_log = None
@@ -1033,6 +1091,16 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
     persistent = False
     trace_health: dict[str, Any] = {"passed": False, "trace_files": [], "ranks": [], "errors": []}
     profile_stopped = False
+    analysis_result: dict[str, Any] = {}
+    workers: list[dict[str, Any]] = []
+
+    def cleanup_profile_processes() -> None:
+        if profile_enabled:
+            from ._server_lifecycle import teardown_lifecycle_server
+
+            for owner in ("serving", "profiler"):
+                teardown_lifecycle_server(pid_dir=workspace / owner, framework="vllm", port=port)
+
     try:
         reuse = lifecycle_enabled and pid_dir and bypass_engine.server_health_ok(base_url)
         if reuse:
@@ -1049,6 +1117,16 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
                 start_new_session=True,
                 text=True,
             )
+            if profile_enabled:
+                bypass_engine.write_lifecycle_files(
+                    pid_dir=workspace / ("profiler" if external_profile else "serving"),
+                    framework="vllm",
+                    port=port,
+                    pid=server_proc.pid,
+                    pgid=os.getpgid(server_proc.pid),
+                    model=served_model_name,
+                    metadata=ownership_metadata,
+                )
             if lifecycle_enabled:
                 # The parent can kill this runner while vLLM is still booting.
                 # Publish ownership now so outer teardown can release the lease
@@ -1079,6 +1157,12 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
                 if "out of memory" in tail.lower() or "cuda oom" in tail.lower():
                     reason = "server_cuda_oom"
                 raise RuntimeError(reason)
+        if external_profile:
+            from .cuda_nsight import rank_processes
+
+            serving_pid = int((workspace / "serving" / f"vllm_{port}.pid").read_text().split()[0])
+            workers = rank_processes(plan.topology, serving_pid, server_log_path)
+            _atomic_write_json(workspace / "rank_processes.json", {"workers": workers})
         _verify_model(base_url, served_model_name)
         quality_gate = _quality_smoke(
             base_url,
@@ -1121,9 +1205,69 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
             profile_started, profile_stopped, _ = _profile_endpoint_status(server_log_path)
             if not profile_started or not profile_stopped:
                 raise RuntimeError("profiler_start_or_stop_failed")
-            from .cuda_profile import validate_cuda_traces
+            if external_profile:
+                from ._server_lifecycle import teardown_lifecycle_server
+                from .cuda_nsight import analyze_nsys, analyze_ncu, write_analysis, ncu_export_argv
 
-            trace_health = validate_cuda_traces(workspace / "torch_trace", world_size=world_size, started_at=start)
+                # Let Nsight finish exporting after the application exits. Never
+                # terminate the wrapper's group before its report is complete.
+                teardown_lifecycle_server(pid_dir=workspace / "serving", framework="vllm", port=port)
+                server_proc.wait(timeout=180)
+                report = workspace / ("capture.nsys-rep" if profile_backend == "nsys" else "capture.ncu-rep")
+                if not report.is_file() or report.stat().st_mtime < start or report.stat().st_size == 0:
+                    raise RuntimeError("missing_or_stale_nsight_report")
+                with (workspace / "export.log").open("w") as export_log:
+                    if profile_backend == "nsys":
+                        database = workspace / "capture.sqlite"
+                        subprocess.run(
+                            [
+                                fingerprints["profiler_tools"]["nsys"]["path"],
+                                "export",
+                                "--type",
+                                "sqlite",
+                                "--output",
+                                str(database),
+                                str(report),
+                            ],
+                            stdout=export_log,
+                            stderr=subprocess.STDOUT,
+                            timeout=120,
+                            check=True,
+                        )
+                        summary = analyze_nsys(database, workers, fingerprints=fingerprints)
+                        analysis_result = write_analysis(workspace, summary)
+                        trace_health = {
+                            "passed": True,
+                            "ranks": summary["ranks"],
+                            "trace_files": [str(report), str(database)],
+                            "errors": [],
+                        }
+                    else:
+                        csv_path = workspace / "capture.csv"
+                        with csv_path.open("w") as csv_stream:
+                            subprocess.run(
+                                ncu_export_argv(report, executable=fingerprints["profiler_tools"]["ncu"]["path"]),
+                                stdout=csv_stream,
+                                stderr=export_log,
+                                timeout=120,
+                                check=True,
+                            )
+                        with (workspace / "capture_nvtx.csv").open("w") as nvtx_stream:
+                            subprocess.run(
+                                ncu_export_argv(
+                                    report, nvtx=True, executable=fingerprints["profiler_tools"]["ncu"]["path"]
+                                ),
+                                stdout=nvtx_stream,
+                                stderr=export_log,
+                                timeout=120,
+                                check=True,
+                            )
+                        trace_health = analyze_ncu(csv_path, workers, str(cuda_profiler["kernel_name"]))
+                        trace_health["trace_files"].insert(0, str(report))
+            else:
+                from .cuda_profile import validate_cuda_traces
+
+                trace_health = validate_cuda_traces(workspace / "torch_trace", world_size=world_size, started_at=start)
             if not trace_health["passed"]:
                 raise RuntimeError("invalid_cuda_trace: " + "; ".join(trace_health["errors"]))
         if lifecycle_enabled and not cleanup_requested and server_proc is not None:
@@ -1168,6 +1312,7 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
         _release_gpu_lease(lease)
         cleanup_status = "released" if _lease_is_released(lease) else "lease_release_failed"
     finally:
+        cleanup_profile_processes()
         if server_log is not None:
             server_log.close()
         if not persistent:
@@ -1193,7 +1338,8 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
                     "schema_version": 1,
                     "status": unified["status"],
                     "measurement_kind": "profile",
-                    "backend": "torch",
+                    "backend": profile_backend,
+                    "analysis_result": analysis_result,
                     "trace_health": trace_health,
                     "trace_files": trace_health["trace_files"],
                     "fingerprints": fingerprints,

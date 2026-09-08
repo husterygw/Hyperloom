@@ -264,6 +264,7 @@ def _seed_shared_state(
         target_id=str(getattr(args, "target", None) or os.environ.get("HYPERLOOM_TARGET", "amd_auto")),
         optimization_level=str(getattr(args, "optimization_level", None) or "config"),
         profile_backend=str(getattr(args, "profile_backend", None) or "torch"),
+        profile_tool_fingerprint=dict(getattr(args, "profile_tool_fingerprint", {}) or {}),
         target_capabilities=getattr(args, "target_capabilities", None)
         or get_target(
             str(getattr(args, "target", None) or os.environ.get("HYPERLOOM_TARGET", "amd_auto"))

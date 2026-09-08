@@ -3,8 +3,8 @@
 更新日期：2026-09-08。范围固定为本机 8×RTX 4090、CUDA 13.0、现有
 `llm_sim` 环境中的 vLLM；暂不扩展其他 GPU、多机或其他 serving framework。
 
-本轮实施边界是阶段 A、B 和 profile/roofline 能力拆分。阶段 C–H 是后续工作，
-不能通过打开 capability 标志替代实现和实机验收。
+首批完成阶段 A、B 和 profile/roofline 能力拆分。阶段 C 的实现与验收见文末；
+阶段 D–H 仍是后续工作，能力开放须有实际执行与验收证据。
 
 ## 完整路线
 
@@ -20,8 +20,8 @@
 | H：组合回放与回归 | 组合已接受的配置、源码、kernel、量化结果；稳定性和故障恢复 | 完整基线/候选三次重放、资源清理、报告和可复现启动配置；按次拆分长时间 soak |
 
 阶段 E/F/G 需要进一步拆分 source/kernel、GEMM tuning、evaluation、warm replay
-能力。当前 CLI 对 `--optimization-level source/kernel`、`--profile-backend nsys`
-明确报未实现；AMD 的原有默认能力保持原语义。
+能力。当前 CLI 对 `--optimization-level source/kernel` 明确报未实现；
+NVIDIA Nsight 使用独立执行器，AMD 的原有默认能力保持原语义。
 
 ## 性能和质量协议
 
@@ -49,7 +49,7 @@ WikiText-2 raw test 的 perplexity，以及 GSM8K main 完整 test。
 关闭 thinking，确定性生成，最大输出 2048 tokens；与同一套 BF16 基线比较。
 校准数据、评估数据和量化产物分别保存指纹。
 
-## 本轮实现
+## 首批 A/B 实现
 
 - `--optimization-level config/profile`、`--profile-backend torch`，状态持久化和恢复冲突检查。
 - `profile`、`roofline`、`trace_analysis` 分开授权；新 NV profile 会话仍不能进入 AMD TraceLens/roofline。
@@ -64,7 +64,7 @@ WikiText-2 raw test 的 perplexity，以及 GSM8K main 完整 test。
 创建并启动 Coordinator。NV profile 在 `cli/executors.py` 注册，实际服务启动在
 `orchestrator/actions/executors/vllm_cuda_runner.py`。
 
-## 验收记录
+## 首批 A/B 验收记录
 
 三种拓扑的独立 profile smoke 使用 ISL=128、OSL=32、并发=2、8 个请求、2 次 warmup；
 Qwen3-8B 示例另行使用其固定的 512/128/4 工作负载。
@@ -104,3 +104,94 @@ PP8 默认 lazy 权重加载很慢，受控停止后使用已有 Qwen3-32B 基�
 实现提交：`76b9ddadf`（Critic 认证）、`57b05302a`（实验隔离）、
 `521763b01`（CUDA profile/能力/预算恢复）、`a4614f2f8`（示例）、
 `0cc7bd40d`（启动取消清理）。当前工作只在本地提交，没有推送。
+
+
+## 阶段 C：Nsight 实现
+
+NVIDIA 新会话显式选择 `--optimization-level profile --profile-backend nsys`，
+默认执行 Nsight Systems 时间线和 Nsight Compute 热点计数器复合动作。
+`--no-enable-roofline` 保留时间线与 `analysis.md`，跳过 ncu；torch 和 config
+仍保留原来的默认行为。恢复会话保留 backend、roofline 开关、工具路径/版本和预算，
+冲突则拒绝恢复，旧会话不会因升级代码而自动获得新能力。实际启动和导出固定
+使用预检选定的绝对路径，CUDA 环境准备对 PATH 的修改不会替换工具。
+
+`CudaRooflineExecutor` 先独立运行 nsys，再为前三个非通信 kernel 名称分别启动
+新的 ncu 服务。每次保留模型、工作负载、拓扑、编译/Graph 和 serving 参数，
+warmup 后最多采集 16 个请求；ncu 每个相关 rank 最多采集 3 次匹配 launch。
+窗口从 nsys 的 native NVTX execution step 确定，包含空 pipeline step，
+起点对齐最晚首次出现的 rank；rank 错开时覆盖其差值与后续 pipeline 周期。
+复合动作最多 45 分钟，另受会话剩余预算
+和阶段取消约束；每次真实实验的 180 分钟上限继续有效。
+
+时间线以实际 worker PID、GPU UUID 和 rank 绑定，计算区间并集、通信重叠、
+copy 和 idle；热点占比以 kernel 时长之和为分母，不能当作墙钟比例。
+独立 ncu 样本还须匹配模型/硬件/工作负载/serving 配置/质量套件指纹及
+rank、grid、block。计数器以 base units 导出，保留原始 metric、单位、
+实际时钟对应的 sustained peak、算术路径和样本来源。
+无法获得的指标显示 unavailable，不填零；fused/Graph kernel 的层归属未知时
+明确保留 unknown。选定 kernel 的 roofline 不外推为整个模型的吞吐上限。
+
+原始 `.nsys-rep`、SQLite、`.ncu-rep`、CSV、`rank_processes.json`、
+`vllm_cuda_profile.json`、`nsight_summary.json` 和 `analysis.md` 均保留。
+计数器失败会保留已验证时间线，同时把复合结果标记为不完整。
+profiling 吞吐只作诊断，不能成为 baseline、current_best 或 KEEP 分数。
+source、kernel 和 quantization 能力仍未开放。阶段 C 的混合并行计数器验收
+仍需补齐，再进入阶段 D 的配置优化验收。
+
+示例命令：
+
+```bash
+PYTHON=/data/ygw/miniconda3/envs/llm_sim/bin/python \
+MODEL_PATH=/data/ygw/models/Qwen3-8B \
+USER_DATA_PATH=/data/ygw/llm_sim/benchmark_results/my_nsight_run \
+bash examples/hyperloom-qwen3-8b-nvidia-3h/run_example.sh \
+  --optimization-level profile --profile-backend nsys
+```
+
+示例仍自动测量 baseline；优化预算 165 分钟，完整 Nsight 模式的 PRELUDE 占
+35%，framework 占 58%，sweep 占 1%。启动入口不变，新增执行器为
+`cuda_roofline.py`，采集/解析工具为 `cuda_nsight.py`。
+
+## 阶段 C 验收记录与剩余项
+
+原始证据根目录为
+`/data/ygw/llm_sim/benchmark_results/hyperloom_nv_nsight_20260908/`。
+环境为 vLLM 0.28.0、torch 2.13.0+cu130、Nsight Systems 2026.1.3、
+Nsight Compute 2026.2.1；本机计数器权限和实际小矩阵采集已验证。
+拓扑 smoke 使用 ISL=128、OSL=32、并发=2、8 个请求；实际 Qwen3-8B
+CLI 使用示例的 512/128/4 工作负载。每次均保留原 serving/CUDA Graph 配置。
+
+| 验证 | 结果 | 证据（相对上述根目录） |
+|---|---|---|
+| CPU 综合回归 | 571 passed、1 skipped、1 xfailed；生命周期专项另有 182 passed | `final_regression.log`、`final_regression.xml`、`cleanup_regression.log` |
+| wheel 隔离 | 984 entries，无测试/实验模块；隔离安装后 CLI、CUDA 执行器和报告辅助函数可导入 | `final_wheel_acceptance.json`、`final_wheel.log` |
+| Qwen2.5-3B 单卡复合采集 | 成功；63,758 个 kernel 事件，前三个热点共 9 个有效 roofline 样本 | `roofline_single_final/executor_result.json`、`final_topology_acceptance.json` |
+| Qwen3-32B TP1/PP8 复合采集 | 成功；213,696 个 kernel 事件，rank 0–7 有效；三个热点共 50 个有效样本，其中最后一个热点仅出现在 rank 7 | `roofline_pp8_final/executor_result.json`、`final_topology_acceptance.json` |
+| Qwen3-8B 实际 CLI | 自动 baseline → nsys → 三次 ncu → state/report；252,596 个 kernel 事件、9 个有效样本；baseline/current_best 保持 203.10486789309786 tok/s/GPU | `cli_acceptance.json`、`cli_writeback_verification.json` |
+| 中断/恢复与报告 | 恢复工具身份、能力、工作负载、165 分钟预算及 baseline；受控 SIGINT 后自动更新带分析链接的报告，counter_status=succeeded | `resume_acceptance.json`、`resume_report_verification.json` |
+| 启动期 SIGKILL | 服务就绪前强杀 runner，外层回收已启动 GPU worker、端口和租约 | `startup_cancel/acceptance.json` |
+| Qwen3-32B TP2/PP4 时间线 | rank 0–7 验证通过；计数器失败后仍保留有效时间线 | `roofline_tp2pp4_final/executor_result.json` |
+| TP2/PP4 单个 decode 热点补充采集 | 成功取得 8 个 rank 各 3 个有效样本；只验证了该热点 | `ncu_mixed_minimal/executor_result.json`、`mixed_window_verification.json` |
+| TP2/PP4 完整计数器 | **未通过**：重启后热点出现步骤变化会漏采，部分窗口出现 sample_tokens RPC 超时 | `roofline_tp2pp4_final/executor_result.json` |
+| 扩展窗口补充实验 | **失败**：尝试按实际采样完成数提前停止，最终仅完成 3/8 个请求；未引入生产代码 | `ncu_mixed_completion/executor_result.json`、`completion_probe_control.json` |
+| 最终资源检查 | GPU 进程、实验所有权 PID 文件、GPU 租约和实验服务监听端口均已释放 | `cleanup_acceptance.json` |
+
+Qwen3-8B CLI 和恢复验证均受控停止，`stop_reason=signal`；报告属于中断时的
+安全网导出，`report_complete=false`，不能宣称自然进入 CLOSE、得到最终 KEEP、
+获得吞吐收益或完成三小时运行。profile 关闭质量评估，仅用于诊断采集，
+也不能替代阶段 D 的质量和性能验收。
+
+开发失败的原始报告均保留。包括导出时 kernel 名称被重命名、pipeline 空步骤
+导致窗口选早，以及 TP 混合并行采集停滞。前两项已修复并通过上述单卡/PP8
+复验；混合并行仍未解决。尝试过的 shmem 参数与外部完成计数控制器未进入
+最终实现。名为 `ncu_mixed_minimal` 的补充实验实际使用完整指标集：环境准备
+使 PATH 包装器失效，未发生指标缩减；随后已固定预检工具的绝对路径。
+恢复控制器也曾过早发信号或误识别 CLI PID，这些失败记录独立保留，
+最终按精确 CLI PID 完成了真实恢复验证。
+
+下一步首先解决 TP2/PP4 在相同工作负载和 CUDA Graph 配置下的稳定热点采集，
+验收要求是新的完整 nsys → 三热点 ncu 运行全部通过 rank、指纹、launch shape
+和算术指标检查。现有固定 execution step 窗口不能保证跨进程重放时同名热点
+仍出现在该窗口；不能用补充单热点成功代替完整验收，也不能静默修改并发或
+关闭 CUDA Graph 来通过。需要仅使用时间线时，可显式加 `--no-enable-roofline`。
+该项通过后，再依据分析结果实施阶段 D，并按 W0–W5 三次复测协议裁决候选。

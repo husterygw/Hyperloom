@@ -545,6 +545,9 @@ def write_minimal_final_report(
         "",
     ]
 
+    from hyperloom.orchestrator.actions.executors.cuda_nsight import report_summary, report_lines
+
+    lines.extend(report_lines(report_summary(state)))
     fd, tmp = tempfile.mkstemp(
         prefix=".final.md.",
         suffix=".tmp",
@@ -647,6 +650,11 @@ def write_minimal_final_json(
     if extra:
         summary.update(extra)
 
+    from hyperloom.orchestrator.actions.executors.cuda_nsight import report_summary
+
+    nsight = report_summary(state)
+    if nsight:
+        summary["nsight_analysis"] = nsight
     fd, tmp = tempfile.mkstemp(
         prefix=".final.json.",
         suffix=".tmp",

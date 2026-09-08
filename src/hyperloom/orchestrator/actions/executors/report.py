@@ -527,8 +527,13 @@ def _build_summary_dict(
     cmp = build_roofline_comparison_from_history(getattr(state, "roofline_snapshots", None))
     if cmp:
         summary["roofline_comparison"] = cmp
-    # Real terminal root cause on baseline_failed: promote the last failed baseline attempt's engine/worker fault over
-    # benign upstream WARNs.
+    from .cuda_nsight import report_summary
+
+    nsight = report_summary(state)
+    if nsight:
+        summary["nsight_analysis"] = nsight
+    # Real terminal root cause on baseline_failed: promote the last failed
+    # baseline attempt's engine/worker fault over benign upstream WARNs.
     failure_summary = _build_failure_summary(state, session_dir)
     if failure_summary:
         summary["failure_summary"] = failure_summary
@@ -678,7 +683,11 @@ def _format_md(summary: dict[str, Any]) -> str:
     lines.extend(_format_compute_partition_section(summary))
 
     roofline_cmp = summary.get("roofline_comparison")
-    if roofline_cmp:
+    if summary.get("nsight_analysis"):
+        from .cuda_nsight import report_lines
+
+        lines.extend(report_lines(summary["nsight_analysis"]))
+    elif roofline_cmp:
         lines.extend(_format_roofline_comparison_section(roofline_cmp))
 
     ext = summary.get("external_baseline")

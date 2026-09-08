@@ -83,6 +83,16 @@ def extract_workload_summary(analysis_md_path: str | Path) -> dict[str, Any]:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return out
+    nsight = read_json(path.parent / "nsight_summary.json", default={}, require_dict=True) or {}
+    if nsight.get("backend") == "nsys" and nsight.get("ranks"):
+        ranks = nsight["ranks"]
+        out.update(
+            compute_pct=sum(r["compute_pct"] for r in ranks) / len(ranks),
+            idle_pct=sum(r["idle_pct"] for r in ranks) / len(ranks),
+            comm_pct=sum(r["communication_pct"] - r["overlap_pct"] for r in ranks) / len(ranks),
+            top_bottleneck=next((r["name"] for r in nsight.get("hot_kernels", [])), None),
+        )
+        return out
     rows = _parse_executive_table(text)
     out["compute_pct"] = _parse_pct(rows.get("Compute %"))
     out["idle_pct"] = _parse_pct(rows.get("Idle %"))
@@ -99,6 +109,18 @@ def _tracelens_dir_for_analysis_md(analysis_md_path: Path) -> Path:
 def extract_top_kernel(analysis_md_path: str | Path) -> dict[str, Any] | None:
     """Return the highest ``percent_of_total`` operation across category metrics."""
     md_path = Path(analysis_md_path)
+    nsight = read_json(md_path.parent / "nsight_summary.json", default={}, require_dict=True) or {}
+    if nsight.get("backend") == "nsys" and nsight.get("hot_kernels"):
+        top = nsight["hot_kernels"][0]
+        return {
+            "name": top["name"],
+            "gpu_pct": top["gpu_pct"],
+            "efficiency_pct": None,
+            "bound_type": "",
+            "category": "communication" if top["communication"] else "compute",
+            "ncu_roofline": top.get("ncu_roofline"),
+            "counter_status": nsight.get("counter_status"),
+        }
     cat_dir = _tracelens_dir_for_analysis_md(md_path) / "category_data"
     if not cat_dir.is_dir():
         return None
@@ -162,7 +184,17 @@ def _compute_within_and_gap(
 
 
 def attach_perfmodel_breakdown(snapshot: dict[str, Any], state: Any, *, arm: str) -> None:
-    """Add ``roofline_provenance`` (+ ``perfmodel_breakdown`` when the PerfModel succeeds) for *arm*."""
+    """Add ``roofline_provenance`` (+ ``perfmodel_breakdown`` when the PerfModel succeeds) for *arm*.
+
+    Best-effort and in place: any failure leaves *snapshot* untouched.
+    """
+    if getattr(state, "target_id", "") == "nvidia_rtx4090_8x_local":
+        snapshot["roofline_provenance"] = {
+            "backend": "nsys/ncu",
+            "scope": "selected kernels",
+            "e2e_ceiling": "unavailable",
+        }
+        return
     try:
         from .roofline_ceiling import (
             apply_runtime_dtype,

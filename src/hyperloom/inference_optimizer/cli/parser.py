@@ -58,6 +58,12 @@ _SECRET_NAME_HINTS = (
 _REDACTED = "***"
 
 
+class _StoreRoofline(argparse.BooleanOptionalAction):
+    def __call__(self, parser, namespace, values, option_string=None):
+        super().__call__(parser, namespace, values, option_string)
+        namespace.enable_roofline_explicit = True
+
+
 class _StoreMaxHours(argparse.Action):
     """Distinguish an explicit budget from the parser default on resume."""
 
@@ -206,7 +212,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--profile-backend",
         choices=("torch", "nsys"),
         default=None,
-        help="NVIDIA profiler backend. Default: torch; nsys is not yet implemented.",
+        help="NVIDIA profiler backend. Default: torch; nsys adds native timeline analysis and optional ncu roofline.",
     )
     opt.add_argument(
         "--target",
@@ -219,8 +225,7 @@ def _build_parser() -> argparse.ArgumentParser:
     opt.add_argument(
         "--codex-cli-auth",
         action=argparse.BooleanOptionalAction,
-        default=(os.environ.get(CODEX_CLI_AUTH_ENV) or "").strip().lower()
-        in {"1", "true", "yes", "on"},
+        default=(os.environ.get(CODEX_CLI_AUTH_ENV) or "").strip().lower() in {"1", "true", "yes", "on"},
         help="Use the existing `codex login` ChatGPT session for orchestration "
         "when no OPENAI/Anthropic gateway variables are configured. The auth "
         "file is copied into private per-run state and removed at teardown.",
@@ -544,8 +549,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "action's per-variant outcomes, tagged `user_skip`.",
     )
     opt.set_defaults(max_hours_explicit=False)
-    opt.add_argument("--max-hours", type=float, default=2.0, action=_StoreMaxHours,
-                     help="Wall-clock budget in hours (default 2.0; NVIDIA resume restores the saved budget)")
+    opt.add_argument(
+        "--max-hours",
+        type=float,
+        default=2.0,
+        action=_StoreMaxHours,
+        help="Wall-clock budget in hours (default 2.0; NVIDIA resume restores the saved budget)",
+    )
     opt.add_argument(
         "--extend-hours",
         dest="extend_hours",
@@ -1110,14 +1120,14 @@ def _build_parser() -> argparse.ArgumentParser:
     opt.add_argument(
         "--enable-roofline",
         dest="enable_roofline",
-        action=argparse.BooleanOptionalAction,
+        action=_StoreRoofline,
         default=True,
         help="Select which analysis action the Coordinator enqueues at "
         "PRELUDE bootstrap and on every +10%% watermark crossing. "
         "Default on: ``roofline`` (composite profile + "
         "trace_analyze + analysis.md). Pass ``--no-enable-roofline`` "
-        "to use plain ``profile`` instead (lighter — captures the "
-        "trace only, skips trace_analyze). Behaviour is otherwise "
+        "to use plain ``profile`` instead (torch trace only; NVIDIA "
+        "Nsight Systems retains timeline analysis and skips ncu counters). Behaviour is otherwise "
         "identical (same idempotency keys, same pending-task "
         "dispatch gate, same watermark anchor update).",
     )

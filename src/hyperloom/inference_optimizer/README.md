@@ -139,16 +139,27 @@ parseable trace containing CUDA kernel events. The runner writes
 status alongside the traces. Throughput measured under profiling is diagnostic
 and cannot update the baseline or a performance winner.
 
-`profile`, `roofline` and `trace_analysis` are independent capabilities. This
-batch enables only torch capture: `nsys`, roofline/TraceLens, source/kernel
-editing and quantization remain unavailable on NVIDIA. Explicit `source`,
-`kernel` or `nsys` selections fail before GPU launch. Resume restores the saved
-feature tier and backend; changing either requires a new session. Old NVIDIA
-sessions remain config-only, and old AMD capability dictionaries retain their
-previous profiling/roofline behavior.
+`profile`, `roofline` and `trace_analysis` are independent capabilities.
+`--optimization-level profile --profile-backend nsys` selects the native NVIDIA
+timeline analyzer and ncu hotspot roofline. `--no-enable-roofline` skips ncu
+while retaining the nsys analysis. Tool paths and versions are checked before
+launch and persisted; resume requires matching backend, roofline setting and
+tools. Old sessions retain their saved capabilities.
 
-The [NVIDIA example](../../../examples/hyperloom-qwen3-8b-nvidia-3h/SKILL.md)
-accepts `--optimization-level profile`. Its optimizer budget is 165 minutes,
+The Nsight route validates every rank against serving-process ownership and
+GPU UUIDs. It reports timeline interval unions, communication overlap and native
+NVTX execution phases. ncu collects up to three launches per rank for each of
+the top three non-communication hotspots, using separate bounded worker
+windows. Counter samples retain their actual launch dimensions, arithmetic
+path, units and metric provenance. Missing or mismatched data fails the
+roofline stage while preserving valid timeline evidence. No end-to-end serving
+ceiling is inferred from selected kernels, and no AMD PerfModel is used.
+A composite analysis is limited to 45 minutes within the session budget.
+
+Source/kernel editing and quantization remain unavailable on NVIDIA. AMD
+profiling and TraceLens retain their existing routes. The
+[NVIDIA example](../../../examples/hyperloom-qwen3-8b-nvidia-3h/SKILL.md) accepts
+the same profile/backend/roofline flags. Its optimizer budget is 165 minutes,
 with a separate process deadline of 180 minutes including cleanup.
 
 ## Layout

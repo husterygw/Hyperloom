@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""Native vLLM torch profiling, with explicit per-rank CUDA trace validation."""
+"""Native vLLM profiling with per-rank CUDA trace and counter validation."""
 
 from __future__ import annotations
 
@@ -57,10 +57,41 @@ def validate_cuda_traces(trace_dir: Path, *, world_size: int, started_at: float)
 class CudaProfileExecutor(BaselineExecutor):
     """Reuse supervised benchmark launch/cleanup without AMD profiler hooks."""
 
+    def __init__(
+        self,
+        *args: Any,
+        backend: str | None = None,
+        kernel_name: str = "",
+        delay_iterations: int = 0,
+        max_iterations: int = 4,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.backend = backend or getattr(self.shared_state, "profile_backend", "torch")
+        self.kernel_name = kernel_name
+        self.delay_iterations = delay_iterations
+        self.max_iterations = max_iterations
+        self._capture_output_dir: Path | None = None
+
     def _after_materialize_config(self, config_path: Path, output_dir: Path) -> None:
+        self._capture_output_dir = output_dir
         cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         bench = cfg["benchmark"]
-        bench["profiler"] = {"torch_profiler": {"enabled": True}}
+        bench["profiler"] = (
+            {"torch_profiler": {"enabled": True}}
+            if self.backend == "torch"
+            else {
+                "cuda_profiler": {
+                    "backend": self.backend,
+                    "kernel_name": self.kernel_name,
+                    "delay_iterations": self.delay_iterations,
+                    "max_iterations": self.max_iterations,
+                    "tools": dict(getattr(self.shared_state, "profile_tool_fingerprint", {}) or {}),
+                }
+            }
+        )
+        if self.backend != "torch":
+            bench["timeout_seconds"] = min(600, int(bench.get("timeout_seconds", 600)))
         bench["server_lifecycle"] = {"enabled": False}
         envs = bench.setdefault("envs", {})
         envs["RUN_EVAL"] = "false"
@@ -72,6 +103,7 @@ class CudaProfileExecutor(BaselineExecutor):
         from ._grid_runner import merge_server_args
 
         params = ctx.task.params or {}
+        params["baseline_double_run"] = False
         params["extra_server_args"] = merge_server_args(
             str(params.get("base_extra_args") or ""), str(params.get("extra_server_args") or "")
         )
@@ -80,8 +112,24 @@ class CudaProfileExecutor(BaselineExecutor):
             if "base_" + key in params:
                 params.setdefault(key, params["base_" + key])
         ctx.task.params = params
-        result = await super().__call__(ctx)
+        if self.backend != "torch":
+            params["timeout_sec"] = min(900, int(params.get("timeout_sec", 900)))
+        self._capture_output_dir = None
+        try:
+            result = await super().__call__(ctx)
+        finally:
+            # Includes runner SIGKILL: ownership files are published before CUDA
+            # initialization, and scoped to this task's materialized workspace.
+            from ._server_lifecycle import teardown_lifecycle_server
+
+            if self._capture_output_dir is not None:
+                for pidfile in self._capture_output_dir.rglob("vllm_*.pid"):
+                    port = pidfile.stem.removeprefix("vllm_")
+                    if port.isdigit():
+                        teardown_lifecycle_server(pid_dir=pidfile.parent, framework="vllm", port=int(port))
         result["measurement_kind"] = "profile"
+        result["valid_measurement"] = False
+        result["backend"] = self.backend
         # Profile overhead is diagnostic only, never an optimization score.
         result["diagnostic_throughput"] = result.get("output_throughput")
         for key in list(result):
@@ -95,6 +143,7 @@ class CudaProfileExecutor(BaselineExecutor):
         profile = json.loads(artifact.read_text(encoding="utf-8"))
         result.update({key: profile[key] for key in ("trace_files", "trace_health", "fingerprints")})
         result["profile_artifact"] = str(artifact)
+        result["analysis_result"] = profile.get("analysis_result", {})
         result["main_trace_path"] = next(iter(profile["trace_files"]), None)
         if profile["status"] != "succeeded":
             result.update(status="failed", error_class="cuda_profile_invalid", error="; ".join(profile["errors"]))

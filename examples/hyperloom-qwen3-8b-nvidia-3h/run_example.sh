@@ -10,6 +10,8 @@ DEMO_PYTHON="${PYTHON:-python}"
 DEMO_DRY_RUN=0
 DEMO_RESUME=""
 DEMO_LEVEL=""
+DEMO_BACKEND=""
+DEMO_ROOFLINE=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-run) DEMO_DRY_RUN=1; shift ;;
@@ -21,6 +23,13 @@ while [ "$#" -gt 0 ]; do
       DEMO_LEVEL="$2"
       shift 2
       ;;
+    --profile-backend)
+      if [ "$#" -lt 2 ] || [[ "$2" != torch && "$2" != nsys ]]; then
+        echo 'error: --profile-backend requires torch or nsys' >&2
+        exit 2
+      fi
+      DEMO_BACKEND="$2"; shift 2 ;;
+    --enable-roofline|--no-enable-roofline) DEMO_ROOFLINE="$1"; shift ;;
     --resume-from)
       if [ "$#" -lt 2 ] || [ -z "$2" ]; then
         echo 'error: --resume-from requires a session directory' >&2
@@ -30,7 +39,7 @@ while [ "$#" -gt 0 ]; do
       shift 2
       ;;
     --help|-h)
-      echo 'Usage: MODEL_PATH=/local/Qwen3-8B USER_DATA_PATH=/data/sessions bash run_example.sh [--dry-run] [--optimization-level config|profile] [--resume-from /absolute/session]'
+      echo 'Usage: MODEL_PATH=/local/Qwen3-8B USER_DATA_PATH=/data/sessions bash run_example.sh [--dry-run] [--optimization-level config|profile] [--profile-backend torch|nsys] [--enable-roofline|--no-enable-roofline] [--resume-from /absolute/session]'
       echo 'Uses the current Python (override with PYTHON). Dry run prints the command without starting Hyperloom.'
       exit 0
       ;;
@@ -54,6 +63,12 @@ DEMO_COMMAND=("$DEMO_PYTHON" -m hyperloom.inference_optimizer.cli optimize
 if [ -n "$DEMO_LEVEL" ]; then
   DEMO_COMMAND+=(--optimization-level "$DEMO_LEVEL")
 fi
+if [ -n "$DEMO_BACKEND" ]; then
+  DEMO_COMMAND+=(--profile-backend "$DEMO_BACKEND")
+fi
+if [ -n "$DEMO_ROOFLINE" ]; then
+  DEMO_COMMAND+=("$DEMO_ROOFLINE")
+fi
 if [ -n "$DEMO_RESUME" ]; then
   if [[ "$DEMO_RESUME" != /* ]] || [ ! -f "$DEMO_RESUME/state.json" ]; then
     echo 'error: --resume-from must name an absolute session directory containing state.json' >&2
@@ -73,6 +88,13 @@ else
     DEMO_PRELUDE_PCT=0.15
     DEMO_FRAMEWORK_PCT=0.78
   fi
+  if [ "$DEMO_BACKEND" = nsys ] && [ "$DEMO_ROOFLINE" != --no-enable-roofline ]; then
+    DEMO_PRELUDE_PCT=0.35
+    DEMO_FRAMEWORK_PCT=0.58
+  fi
+  if [ "$DEMO_BACKEND" != nsys ] && [ -z "$DEMO_ROOFLINE" ]; then
+    DEMO_COMMAND+=(--no-enable-roofline)
+  fi
   DEMO_COMMAND+=(
     --model "$MODEL_PATH" --framework vllm
     --tp 1 --pp 1 --ep 1 --precision bf16
@@ -82,7 +104,7 @@ else
     --target-gain 30 --max-hours 2.75
     --max-minutes-prelude-pct "$DEMO_PRELUDE_PCT"
     --max-minutes-framework-pct "$DEMO_FRAMEWORK_PCT" --max-minutes-sweep-pct 0.01
-    --no-kernel --no-enable-conc-sweep --no-enable-roofline
+    --no-kernel --no-enable-conc-sweep
     --no-warm-replay --no-eval
   )
 fi

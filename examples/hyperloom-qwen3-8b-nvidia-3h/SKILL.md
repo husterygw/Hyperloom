@@ -40,9 +40,20 @@ The loop can benchmark, explore allowed vLLM configuration changes, keep or
 revert candidates, and report results. Add `--optimization-level profile` to
 capture native vLLM torch traces, validated for every TP×PP rank. This preset
 reserves 15% of the optimization budget for PRELUDE (baseline plus profiling). Profiling
-measurements are diagnostic and cannot become performance winners. Roofline,
+measurements are diagnostic and cannot become performance winners.
+
+Use `--optimization-level profile --profile-backend nsys` for a native Nsight
+timeline plus ncu hotspot roofline. This mode reserves 35% of the budget for
+PRELUDE; `--no-enable-roofline` skips ncu while retaining timeline analysis.
+The existing environment must provide `nsys` and, when roofline is enabled,
+`ncu`; preflight checks tool identity and resumes require matching tools and
+settings. Each composite analysis is capped at 45 minutes within the session
+budget. Raw reports, rank identities, counter availability and partial failures
+are retained alongside `analysis.md`; profiling scores cannot become KEEP.
+
+The following capabilities remain disabled:
 framework source patches, kernel optimization, quantization, evaluation, warm replay, and
-multi-node execution remain disabled. Keep FRAMEWORK_AGENT enabled for config
+multi-node execution. Keep FRAMEWORK_AGENT enabled for config
 exploration; do not pass `--no-framework-agent`. As in the original short demo,
 the extra post-optimization concurrency sweep is disabled.
 

@@ -987,9 +987,10 @@ class WritebackCollaborator:
             return False
         if result.get("measurement_kind") == "profile":
             return (
-                task_kind == "profile"
+                task_kind in ("profile", "roofline")
                 and result.get("status") == "succeeded"
                 and bool((result.get("trace_health") or {}).get("passed"))
+                and (task_kind == "profile" or bool((result.get("counter_health") or {}).get("passed")))
             )
         if task_kind == "baseline":
             # A baseline whose accuracy eval failed measured throughput but must
@@ -3931,8 +3932,12 @@ class WritebackCollaborator:
             self.shared_state.last_profile_args = str(
                 self.shared_state.last_profile_workload.get("server_args") or profile_args
             )
-            # New trace invalidates the stale trace_analyze cache.
-            self.shared_state.last_trace_analyze = {}
+            # Nsight supplies its deterministic analysis with the new trace.
+            analysis = result.get("analysis_result") or {}
+            if result.get("backend") == "nsys" and analysis.get("status") == "succeeded":
+                self.shared_state.record_trace_analyze({"trace_input": trace_path}, analysis)
+            else:
+                self.shared_state.last_trace_analyze = {}
             changed = True
             audit_extras["trace_path"] = str(trace_path)
             audit_extras["profile_args"] = profile_args

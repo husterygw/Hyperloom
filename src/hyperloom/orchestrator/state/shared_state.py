@@ -451,6 +451,7 @@ class SharedState(_RenderMixin, _ExploreStateMixin):
     target_capabilities: dict[str, bool] = field(default_factory=dict)
     optimization_level: str = "config"
     profile_backend: str = "torch"
+    profile_tool_fingerprint: dict[str, Any] = field(default_factory=dict)
     hardware_fingerprint: dict[str, Any] = field(default_factory=dict)
     # Workload metadata mirrored from manifest.json at session start; resume re-exports env vars.
     tp: int = 0
@@ -2446,6 +2447,7 @@ class SharedState(_RenderMixin, _ExploreStateMixin):
                 "suggestion": entry.get("suggestion") or "",
                 "roofline_name": entry.get("roofline_name"),
                 "rocprof_roofline": rocprof_roofline,
+                "ncu_roofline": entry.get("ncu_roofline"),
                 "source_file": entry.get("source_file"),
                 "reusable_native_kernel": reusable,
                 "kernel_contract": entry.get("kernel_contract"),
@@ -2475,6 +2477,7 @@ class SharedState(_RenderMixin, _ExploreStateMixin):
                     "suggestion",
                     "roofline_name",
                     "rocprof_roofline",
+                    "ncu_roofline",
                 )
             ):
                 kernel_roofline.append(dict(summary_entry))
