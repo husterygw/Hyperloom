@@ -5,6 +5,7 @@
 import gzip
 import json
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -39,6 +40,8 @@ def _trace(root, rank=0, *, kernel=True):
     path = root / f"dp0_pp0_tp0_dcp0_ep0_rank{rank}.123.pt.trace.json.gz"
     with gzip.open(path, "wt") as stream:
         json.dump({"traceEvents": [{"cat": "kernel" if kernel else "cpu_op", "ph": "X", "dur": 5}]}, stream)
+    stamp = time.time()
+    os.utime(path, (stamp, stamp))  # Explicit time avoids coarse filesystem-clock flakes.
     return path
 
 

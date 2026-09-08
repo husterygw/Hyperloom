@@ -879,6 +879,8 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
     cleanup_requested = bool(lifecycle.get("cleanup", True)) if lifecycle_enabled else True
     ready_timeout_s = max(30, _int(lifecycle.get("server_ready_timeout_s"), timeout_s))
     pid_dir = str(lifecycle.get("pid_dir") or "")
+    if lifecycle_enabled and not pid_dir:
+        raise ValueError("server_lifecycle.enabled requires pid_dir")
     port = _int(envs.get("PORT"), 0) or _pick_port()
     served_model_name = f"hyperloom-{_fingerprint({'model': model})[:12]}"
     base_url = f"http://127.0.0.1:{port}"
@@ -1047,6 +1049,25 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
                 start_new_session=True,
                 text=True,
             )
+            if lifecycle_enabled:
+                # The parent can kill this runner while vLLM is still booting.
+                # Publish ownership now so outer teardown can release the lease
+                # even if this process never reaches its Python cleanup handler.
+                pgid = os.getpgid(server_proc.pid)
+                bypass_engine.write_lifecycle_files(
+                    pid_dir=pid_dir,
+                    framework="vllm",
+                    port=port,
+                    pid=server_proc.pid,
+                    pgid=pgid,
+                    model=served_model_name,
+                    metadata={
+                        "gpu_lease_holder": lease.holder_id,
+                        "gpu_lease_task": lease.task_id,
+                        "gpu_indices": list(lease.gpu_ids),
+                        "gpu_uuids": list(lease.gpu_uuids),
+                    },
+                )
             memory_sampler.start()
             if not _wait_ready(base_url, timeout_s=ready_timeout_s, proc=server_proc):
                 tail = ""
@@ -1106,21 +1127,6 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
             if not trace_health["passed"]:
                 raise RuntimeError("invalid_cuda_trace: " + "; ".join(trace_health["errors"]))
         if lifecycle_enabled and not cleanup_requested and server_proc is not None:
-            pgid = os.getpgid(server_proc.pid)
-            bypass_engine.write_lifecycle_files(
-                pid_dir=pid_dir,
-                framework="vllm",
-                port=port,
-                pid=server_proc.pid,
-                pgid=pgid,
-                model=served_model_name,
-                metadata={
-                    "gpu_lease_holder": lease.holder_id,
-                    "gpu_lease_task": lease.task_id,
-                    "gpu_indices": list(lease.gpu_ids),
-                    "gpu_uuids": list(lease.gpu_uuids),
-                },
-            )
             persistent = True
             cleanup_status = "deferred"
         else:
@@ -1134,6 +1140,10 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
             cleanup_status = "released" if _lease_is_released(lease) else "lease_release_failed"
     except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - normalized into artifacts
         errors.append(f"{type(exc).__name__}: {exc}")
+        # A profiler flush/server teardown may exceed the supervisor's TERM
+        # grace. Release the database row first; the host lock still serializes
+        # GPU launches until this runner is reaped.
+        _release_gpu_lease(lease)
         profile_started, profile_stopped, stop_attempted = (
             _profile_endpoint_status(server_log_path)
             if profile_enabled and server_log_path.exists()

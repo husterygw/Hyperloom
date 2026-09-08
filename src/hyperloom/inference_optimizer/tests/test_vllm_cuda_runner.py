@@ -418,3 +418,57 @@ def test_runner_requires_validated_target_and_hardware(tmp_path, monkeypatch):
     monkeypatch.delenv("HYPERLOOM_TARGET_RUNTIME", raising=False)
     with pytest.raises(ValueError, match="requires HYPERLOOM_TARGET"):
         runner.run_benchmark(_config(tmp_path), tmp_path / "output")
+
+
+def test_lifecycle_ownership_is_published_before_server_ready(tmp_path, monkeypatch):
+    from hyperloom.orchestrator.actions.executors._server_lifecycle import teardown_lifecycle_server
+
+    session_dir = _cuda_env(monkeypatch, tmp_path)
+    path = _config(tmp_path)
+    cfg = yaml.safe_load(path.read_text())
+    pid_dir = tmp_path / "pid"
+    cfg["benchmark"]["server_lifecycle"] = {"enabled": True, "cleanup": False, "pid_dir": str(pid_dir)}
+    cfg["benchmark"]["envs"]["PORT"] = 18080
+    path.write_text(yaml.safe_dump(cfg))
+    monkeypatch.setattr(runner.subprocess, "Popen", _FinishedServer)
+    monkeypatch.setattr(runner.os, "getpgid", lambda pid: pid)
+
+    def killed_before_ready(*args, **kwargs):
+        metadata = json.loads((pid_dir / "vllm_18080.json").read_text())
+        assert metadata["gpu_lease_holder"].startswith("vllm_cuda:")
+        # The supervisor can recover ownership without the runner's finally.
+        teardown_lifecycle_server(pid_dir=pid_dir, framework="vllm", port=18080)
+        with sqlite3.connect(session_dir / "storage/coordinator.db") as conn:
+            assert conn.execute("SELECT COUNT(*) FROM gpu_leases").fetchone()[0] == 0
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(runner, "_wait_ready", killed_before_ready)
+    assert runner.run_benchmark(path, tmp_path / "output") == 1
+
+
+def test_cancel_releases_lease_before_slow_server_teardown(tmp_path, monkeypatch):
+    session_dir = _cuda_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(runner.subprocess, "Popen", _FinishedServer)
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(runner, "_wait_ready", interrupted)
+
+    def teardown(proc):
+        with sqlite3.connect(session_dir / "storage/coordinator.db") as db:
+            assert db.execute("SELECT COUNT(*) FROM gpu_leases").fetchone()[0] == 0
+
+    monkeypatch.setattr(runner, "_terminate_group", teardown)
+    assert runner.run_benchmark(_config(tmp_path), tmp_path / "out") == 1
+
+
+def test_lifecycle_requires_an_ownership_directory(tmp_path, monkeypatch):
+    _cuda_env(monkeypatch, tmp_path)
+    path = _config(tmp_path)
+    cfg = yaml.safe_load(path.read_text())
+    cfg["benchmark"]["server_lifecycle"] = {"enabled": True}
+    path.write_text(yaml.safe_dump(cfg))
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda *a, **kw: pytest.fail("server launched"))
+    with pytest.raises(ValueError, match="requires pid_dir"):
+        runner.run_benchmark(path, tmp_path / "out")
