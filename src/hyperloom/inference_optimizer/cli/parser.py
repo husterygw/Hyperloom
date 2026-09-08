@@ -58,6 +58,14 @@ _SECRET_NAME_HINTS = (
 _REDACTED = "***"
 
 
+class _StoreMaxHours(argparse.Action):
+    """Distinguish an explicit budget from the parser default on resume."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        namespace.max_hours = values
+        namespace.max_hours_explicit = True
+
+
 def _is_secret_name(name: str) -> bool:
     """Report whether a flag or variable name suggests a credential."""
     lowered = name.lstrip("-").lower()
@@ -188,6 +196,18 @@ def _build_parser() -> argparse.ArgumentParser:
     opt = sub.add_parser("optimize", help="Drive a multi-agent optimization run on a model")
     from ..target_registry import DEFAULT_TARGET, target_names
 
+    opt.add_argument(
+        "--optimization-level",
+        choices=("config", "profile", "source", "kernel"),
+        default=None,
+        help="NVIDIA feature tier. Default: config. Currently config/profile are implemented.",
+    )
+    opt.add_argument(
+        "--profile-backend",
+        choices=("torch", "nsys"),
+        default=None,
+        help="NVIDIA profiler backend. Default: torch; nsys is not yet implemented.",
+    )
     opt.add_argument(
         "--target",
         choices=target_names(),
@@ -523,7 +543,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "state.json under `explore_search.last_round.skipped_dup`, and in the "
         "action's per-variant outcomes, tagged `user_skip`.",
     )
-    opt.add_argument("--max-hours", type=float, default=2.0, help="Wall-clock budget in hours (default 2.0)")
+    opt.set_defaults(max_hours_explicit=False)
+    opt.add_argument("--max-hours", type=float, default=2.0, action=_StoreMaxHours,
+                     help="Wall-clock budget in hours (default 2.0; NVIDIA resume restores the saved budget)")
     opt.add_argument(
         "--extend-hours",
         dest="extend_hours",

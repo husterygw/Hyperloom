@@ -61,7 +61,7 @@ Cursor and Claw.
 
 ## Experimental NVIDIA/vLLM target
 
-The `nvidia_rtx4090_8x_local` target is the config-only CUDA MVP for the
+The `nvidia_rtx4090_8x_local` target defaults to config optimization for the
 validated local host: exactly eight RTX 4090 GPUs (compute capability 8.9) and
 CUDA 13.0 at `/usr/local/cuda-13.0`. vLLM is operator-managed rather than
 version-pinned: preflight probes the selected interpreter's `vllm serve` and
@@ -98,8 +98,8 @@ external isolation boundary but blocks bubblewrap namespaces, use the documented
 double opt-in `HYPERLOOM_CODEX_SANDBOX_MODE=bypass` plus
 `HYPERLOOM_CODEX_EXTERNAL_SANDBOX=1`.
 
-The target supports baseline, config exploration, sweep, and report. Profile,
-source patching, kernel patching, quantization, warm replay, evaluation, and
+The target supports baseline, config exploration, sweep, report, and opt-in
+torch profiling (see below). Source patching, kernel patching, quantization, warm replay, evaluation, and
 multi-node execution are disabled by target capabilities. Each benchmark emits
 an atomic `vllm_cuda_benchmark.json`, the compatibility
 `benchmark_report.json`, raw vLLM JSON/logs, a launch plan, total tok/s,
@@ -118,6 +118,38 @@ smoke request it records the rendered prompts and non-empty responses for
 Chinese/English, short/long, and thinking/non-thinking cases in
 `quality_cases.json`. The suite uses the checkpoint's local tokenizer and the
 stable completions endpoint, so it does not depend on a particular vLLM version.
+
+The fixed Qwen3-32B baseline, topology/config search, and local service/stability
+experiments have moved to the source-only [NVIDIA Qwen3 experiments](../../../experiments/nvidia_qwen3/README.md).
+They use a separate CLI and are not part of the installed optimizer.
+
+### Opt-in CUDA profiling
+
+The NVIDIA target defaults to `--optimization-level config`. Add
+`--optimization-level profile --profile-backend torch` to capture native vLLM
+torch traces after the baseline and at the existing analysis checkpoints.
+The installed vLLM must expose `serve --profiler-config` and
+`bench serve --profile`; preflight rejects a missing interface.
+
+CUDA profiling preserves the current configuration, including compilation and
+CUDA Graph flags. It runs on a dedicated server, warms up before capture, and
+limits the capture window to 16 requests. Each TP×PP rank must produce a fresh,
+parseable trace containing CUDA kernel events. The runner writes
+`vllm_cuda_profile.json` with trace health, topology, fingerprints and cleanup
+status alongside the traces. Throughput measured under profiling is diagnostic
+and cannot update the baseline or a performance winner.
+
+`profile`, `roofline` and `trace_analysis` are independent capabilities. This
+batch enables only torch capture: `nsys`, roofline/TraceLens, source/kernel
+editing and quantization remain unavailable on NVIDIA. Explicit `source`,
+`kernel` or `nsys` selections fail before GPU launch. Resume restores the saved
+feature tier and backend; changing either requires a new session. Old NVIDIA
+sessions remain config-only, and old AMD capability dictionaries retain their
+previous profiling/roofline behavior.
+
+The [NVIDIA example](../../../examples/hyperloom-qwen3-8b-nvidia-3h/SKILL.md)
+accepts `--optimization-level profile`. Its optimizer budget is 165 minutes,
+with a separate process deadline of 180 minutes including cleanup.
 
 ## Layout
 

@@ -133,9 +133,9 @@ TARGET_CAPABILITY_ACTIONS: Mapping[str, str] = MappingProxyType(
         "report": "report",
         "session_breakdown": "report",
         "profile": "profile",
-        "roofline": "profile",
-        "trace_analyze": "profile",
-        "record_trace_analyze": "profile",
+        "roofline": "roofline",
+        "trace_analyze": "trace_analysis",
+        "record_trace_analyze": "trace_analysis",
         "integrate_patch": "source_patch",
         "replay_warm_recipe": "source_patch",
         "framework_targeted_build": "source_patch",
@@ -148,6 +148,13 @@ TARGET_CAPABILITY_ACTIONS: Mapping[str, str] = MappingProxyType(
         "run_gemm_tuning": "kernel_patch",
     }
 )
+
+
+def target_capability_enabled(capabilities: Mapping[str, bool], required: str) -> bool:
+    """Keep old session semantics for families split from profiling."""
+    if required in ("roofline", "trace_analysis") and required not in capabilities:
+        return bool(capabilities.get("profile", False))
+    return bool(capabilities.get(required, False))
 
 
 @dataclass(frozen=True)

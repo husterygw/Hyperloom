@@ -266,6 +266,13 @@ def _register_executors(
         specialist_executor: Optional specialist executor to register.
     """
     for kind, fn in _REAL_EXECUTORS_FULL.items():
+        if (
+            kind == "profile"
+            and getattr(coordinator.shared_state, "target_id", "amd_auto") == "nvidia_rtx4090_8x_local"
+        ):
+            from hyperloom.orchestrator.actions.executors.cuda_profile import CudaProfileExecutor
+
+            fn = CudaProfileExecutor(session_dir=session_dir, shared_state=coordinator.shared_state)
         coordinator.sub.register_executor(kind, fn)
 
     coordinator.sub.register_executor(

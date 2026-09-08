@@ -169,14 +169,16 @@ class PreludePhase(PhaseHandler):
     """Extracted phase handler; delegates unknown attrs to its Coordinator."""
 
     def _internal_analysis_kind(self) -> str:
-        """Pick the kind for the next Coordinator-internal analysis task: roofline when enable_roofline else profile."""
-        return (
-            "roofline"
-            if bool(
-                getattr(self.shared_state, "enable_roofline", True),
-            )
-            else "profile"
-        )
+        """Pick the kind for the next Coordinator-internal analysis task: roofline when enable_roofline else profile.
+
+        Returns:
+            ``"roofline"`` when roofline is enabled, else ``"profile"``.
+        """
+        from hyperloom.inference_optimizer.protocol.action_surfaces import target_capability_enabled
+
+        capabilities = getattr(self.shared_state, "target_capabilities", {})
+        roofline_available = not capabilities or target_capability_enabled(capabilities, "roofline")
+        return "roofline" if self.shared_state.enable_roofline and roofline_available else "profile"
 
     def _measured_analysis_cost_sec(self) -> float:
         """Expected cost of the initial roofline/profile arm, in seconds."""

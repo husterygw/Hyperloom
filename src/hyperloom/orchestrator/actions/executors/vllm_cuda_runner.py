@@ -16,12 +16,14 @@ import ctypes
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -97,6 +99,87 @@ class _Lease:
     gpu_ids: tuple[int, ...]
     gpu_uuids: tuple[str, ...]
     numa_nodes: tuple[int | None, ...]
+
+
+class _GpuMemorySampler:
+    """Best-effort NVML memory sampler scoped to one runner-owned benchmark.
+
+    Sampling is diagnostic, never a prerequisite for serving success: the
+    target preflight already requires NVML, but an intermittent driver query
+    must not discard a valid benchmark or prevent the runner's cleanup path.
+    """
+
+    def __init__(self, gpu_ids: tuple[int, ...], *, interval_sec: float = 0.25):
+        self.gpu_ids = tuple(gpu_ids)
+        self.interval_sec = max(0.05, float(interval_sec))
+        self._samples: dict[int, list[float]] = {gpu_id: [] for gpu_id in self.gpu_ids}
+        self._errors: list[str] = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._nvml: Any = None
+        self._handles: dict[int, Any] = {}
+
+    def start(self) -> None:
+        """Start polling after the runner has spawned or attached to the server."""
+        if self._thread is not None or self._nvml is not None:
+            return
+        try:
+            import pynvml  # type: ignore[import-not-found]
+
+            pynvml.nvmlInit()
+            self._nvml = pynvml
+            self._handles = {gpu_id: pynvml.nvmlDeviceGetHandleByIndex(gpu_id) for gpu_id in self.gpu_ids}
+            self._sample_once()
+            self._thread = threading.Thread(target=self._run, name="hyperloom-gpu-memory", daemon=True)
+            self._thread.start()
+        except Exception as exc:  # noqa: BLE001 - diagnostics are non-fatal
+            self._errors.append(f"nvml_init:{type(exc).__name__}:{exc}")
+            self._nvml = None
+            self._handles = {}
+
+    def _sample_once(self) -> None:
+        if self._nvml is None:
+            return
+        try:
+            rows = {
+                gpu_id: float(self._nvml.nvmlDeviceGetMemoryInfo(handle).used) / (1024.0 * 1024.0)
+                for gpu_id, handle in self._handles.items()
+            }
+            with self._lock:
+                for gpu_id, used_mib in rows.items():
+                    self._samples[gpu_id].append(round(used_mib, 3))
+        except Exception as exc:  # noqa: BLE001 - one failed poll must not kill serving
+            with self._lock:
+                if len(self._errors) < 3:
+                    self._errors.append(f"nvml_sample:{type(exc).__name__}:{exc}")
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_sec):
+            self._sample_once()
+
+    def stop(self) -> dict[str, Any]:
+        """Stop sampling and return a compact, JSON-safe summary."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.interval_sec * 4.0))
+        self._sample_once()
+        with self._lock:
+            per_gpu = {
+                str(gpu_id): {
+                    "samples": len(values),
+                    "min_used_mib": min(values) if values else 0.0,
+                    "max_used_mib": max(values) if values else 0.0,
+                    "last_used_mib": values[-1] if values else 0.0,
+                }
+                for gpu_id, values in self._samples.items()
+            }
+            return {
+                "status": "collected" if any(values for values in self._samples.values()) else "unavailable",
+                "interval_ms": int(self.interval_sec * 1000),
+                "per_gpu": per_gpu,
+                "errors": list(self._errors),
+            }
 
 
 def _cleanup_signal_handler(_signum: int, _frame: Any) -> None:
@@ -228,8 +311,7 @@ def _tokenize_extra_args(envs: dict[str, Any]) -> list[str]:
         missing = sorted({token.split("=", 1)[0] for token in tokens if token.startswith("--")} - available_flags)
         if missing:
             raise ValueError(
-                "EXTRA_VLLM_ARGS contains flag(s) not supported by the installed vLLM CLI: "
-                + ", ".join(missing)
+                "EXTRA_VLLM_ARGS contains flag(s) not supported by the installed vLLM CLI: " + ", ".join(missing)
             )
     return tokens
 
@@ -421,10 +503,7 @@ def _completion_text(payload: dict[str, Any]) -> str:
 
 def _qwen3_p3_cases() -> tuple[dict[str, Any], ...]:
     """Return the small, deterministic semantic matrix required by NVIDIA P3."""
-    cn_context = "\n".join(
-        "背景资料：植物利用光能把二氧化碳和水转化为有机物，并释放氧气。"
-        for _ in range(12)
-    )
+    cn_context = "\n".join("背景资料：植物利用光能把二氧化碳和水转化为有机物，并释放氧气。" for _ in range(12))
     en_context = "\n".join(
         "Background: photosynthesis uses light energy to convert water and carbon dioxide into sugars and oxygen."
         for _ in range(12)
@@ -637,6 +716,7 @@ def normalize_vllm_result(
     quality_gate: dict[str, Any],
     cleanup_status: str,
     failure_reason: str = "",
+    gpu_memory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Normalize a capability-validated vLLM bench JSON into the stable CUDA schema."""
     world_size = int(plan.topology["world_size"])
@@ -676,6 +756,7 @@ def normalize_vllm_result(
             "total_output_tokens": _int(raw.get("total_output_tokens")),
             "duration_seconds": _float(raw.get("duration")),
             "latency": {metric: _latency_percentiles(raw, metric) for metric in ("ttft", "tpot", "itl", "e2el")},
+            "gpu_memory": dict(gpu_memory or {"status": "unavailable", "per_gpu": {}, "errors": []}),
         },
         "quality_gate": quality_gate,
         "raw_artifacts": plan.artifacts,
@@ -712,6 +793,8 @@ def _compatibility_report(
         errors=errors,
     )
     report["vllm_cuda"] = unified
+    if unified.get("measurement_kind") == "profile":
+        report["measurement_kind"] = "profile"
     report["output_throughput_total"] = metrics.get("output_tokens_per_second_total", 0.0)
     report["output_throughput_per_gpu"] = metrics.get("output_tokens_per_second_per_gpu", 0.0)
     return report
@@ -729,6 +812,29 @@ def _find_raw_result(workspace: Path) -> tuple[Path, dict[str, Any]]:
 
 
 def run_benchmark(config_path: Path, output_dir: Path) -> int:
+    from .cuda_host_lock import CudaHostLock
+
+    with CudaHostLock(f"benchmark:{output_dir}"):
+        return _run_benchmark(config_path, output_dir)
+
+
+def _profile_endpoint_status(server_log_path: Path) -> tuple[bool, bool, bool]:
+    """Read server acknowledgements; bench mislabels empty HTTP 200 responses.
+
+    A stop request is not idempotent in torch/vLLM. Never retry a stop that
+    reached the server, including one still exporting the trace.
+    """
+    try:
+        log_text = server_log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False, False, False
+    started = bool(re.search(r'POST /start_profile HTTP/[^"\s]+" 200(?: |$)', log_text, re.MULTILINE))
+    stopped = bool(re.search(r'POST /stop_profile HTTP/[^"\s]+" 200(?: |$)', log_text, re.MULTILINE))
+    stop_attempted = "Stopping profiler..." in log_text or "POST /stop_profile " in log_text
+    return started, stopped, stop_attempted
+
+
+def _run_benchmark(config_path: Path, output_dir: Path) -> int:
     """Run one YAML-configured vLLM CUDA benchmark."""
     target_id = os.environ.get("HYPERLOOM_TARGET", "").strip()
     target_runtime = os.environ.get("HYPERLOOM_TARGET_RUNTIME", "").strip().lower()
@@ -762,7 +868,13 @@ def run_benchmark(config_path: Path, output_dir: Path) -> int:
     num_warmups = max(0, _int(envs.get("NUM_WARMUPS"), 1))
     max_model_len = max(isl + osl, _int(envs.get("MAX_MODEL_LEN"), isl + osl + 32))
     timeout_s = max(60, _int(bench.get("timeout_seconds"), 3600))
+    profile_enabled = bool(((bench.get("profiler") or {}).get("torch_profiler") or {}).get("enabled"))
+    if profile_enabled and num_prompts > 16:
+        raise ValueError("CUDA profiling is limited to 16 requests per trace window")
     lifecycle = bench.get("server_lifecycle") or {}
+    if profile_enabled:
+        lifecycle = {}  # Profiling always owns a fresh server and releases it.
+
     lifecycle_enabled = bool(lifecycle.get("enabled"))
     cleanup_requested = bool(lifecycle.get("cleanup", True)) if lifecycle_enabled else True
     ready_timeout_s = max(30, _int(lifecycle.get("server_ready_timeout_s"), timeout_s))
@@ -848,6 +960,16 @@ def run_benchmark(config_path: Path, output_dir: Path) -> int:
         raw_path.name,
         "--disable-tqdm",
     ]
+    if profile_enabled:
+        profiler_config = {
+            "profiler": "torch",
+            "torch_profiler_dir": str((workspace / "torch_trace").resolve()),
+            "torch_profiler_with_stack": False,
+            "torch_profiler_record_shapes": True,
+            "torch_profiler_dump_cuda_time_total": False,
+        }
+        server_argv.extend(["--profiler-config", json.dumps(profiler_config)])
+        benchmark_argv.append("--profile")
     fingerprints = {
         "hardware": str(hardware_payload["sha256"]),
         "model": _model_fingerprint(model),
@@ -901,16 +1023,20 @@ def run_benchmark(config_path: Path, output_dir: Path) -> int:
     start = time.time()
     server_proc: subprocess.Popen[Any] | None = None
     server_log = None
+    memory_sampler = _GpuMemorySampler(gpu_ids)
     errors: list[str] = []
     raw: dict[str, Any] = {}
     quality_gate: dict[str, Any] = {"passed": False}
     cleanup_status = "pending"
     persistent = False
+    trace_health: dict[str, Any] = {"passed": False, "trace_files": [], "ranks": [], "errors": []}
+    profile_stopped = False
     try:
         reuse = lifecycle_enabled and pid_dir and bypass_engine.server_health_ok(base_url)
         if reuse:
             if not bypass_engine.lifecycle_files_present(pid_dir, "vllm", port):
                 raise RuntimeError(f"port {port} is healthy but not owned by this Hyperloom lifecycle")
+            memory_sampler.start()
         else:
             server_log = server_log_path.open("a", encoding="utf-8")
             server_proc = subprocess.Popen(  # noqa: S603 - argv is materialized, no shell
@@ -921,6 +1047,7 @@ def run_benchmark(config_path: Path, output_dir: Path) -> int:
                 start_new_session=True,
                 text=True,
             )
+            memory_sampler.start()
             if not _wait_ready(base_url, timeout_s=ready_timeout_s, proc=server_proc):
                 tail = ""
                 try:
@@ -967,6 +1094,17 @@ def run_benchmark(config_path: Path, output_dir: Path) -> int:
             raise RuntimeError(
                 f"benchmark_request_failure_completed_{completed_requests}_expected_{num_prompts}_failed_{failed_requests}"
             )
+        if profile_enabled:
+            # vLLM bench warms up first and brackets measured requests with the
+            # native start/stop endpoints. It does not fail on endpoint errors.
+            profile_started, profile_stopped, _ = _profile_endpoint_status(server_log_path)
+            if not profile_started or not profile_stopped:
+                raise RuntimeError("profiler_start_or_stop_failed")
+            from .cuda_profile import validate_cuda_traces
+
+            trace_health = validate_cuda_traces(workspace / "torch_trace", world_size=world_size, started_at=start)
+            if not trace_health["passed"]:
+                raise RuntimeError("invalid_cuda_trace: " + "; ".join(trace_health["errors"]))
         if lifecycle_enabled and not cleanup_requested and server_proc is not None:
             pgid = os.getpgid(server_proc.pid)
             bypass_engine.write_lifecycle_files(
@@ -996,6 +1134,22 @@ def run_benchmark(config_path: Path, output_dir: Path) -> int:
             cleanup_status = "released" if _lease_is_released(lease) else "lease_release_failed"
     except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - normalized into artifacts
         errors.append(f"{type(exc).__name__}: {exc}")
+        profile_started, profile_stopped, stop_attempted = (
+            _profile_endpoint_status(server_log_path)
+            if profile_enabled and server_log_path.exists()
+            else (False, False, False)
+        )
+        if profile_started and not stop_attempted and server_proc is not None and server_proc.poll() is None:
+            # Even a timed-out/interrupted client must release profiler state
+            # before the same process-group and lease cleanup as any benchmark.
+            import urllib.request
+
+            try:
+                request = urllib.request.Request(base_url + "/stop_profile", data=b"", method="POST")
+                with urllib.request.urlopen(request, timeout=60):
+                    pass
+            except Exception as stop_exc:  # noqa: BLE001 - cleanup must continue
+                errors.append(f"profiler_cleanup: {stop_exc}")
         if lifecycle_enabled and pid_dir:
             from ._server_lifecycle import teardown_lifecycle_server
 
@@ -1006,8 +1160,11 @@ def run_benchmark(config_path: Path, output_dir: Path) -> int:
     finally:
         if server_log is not None:
             server_log.close()
-        if not persistent and server_proc is not None:
+        if not persistent:
             _terminate_group(server_proc)
+            _release_gpu_lease(lease)
+
+    gpu_memory = memory_sampler.stop()
 
     try:
         unified = normalize_vllm_result(
@@ -1016,7 +1173,26 @@ def run_benchmark(config_path: Path, output_dir: Path) -> int:
             quality_gate=quality_gate,
             cleanup_status=cleanup_status,
             failure_reason="; ".join(errors),
+            gpu_memory=gpu_memory,
         )
+        if profile_enabled:
+            unified["measurement_kind"] = "profile"
+            _atomic_write_json(
+                workspace / "vllm_cuda_profile.json",
+                {
+                    "schema_version": 1,
+                    "status": unified["status"],
+                    "measurement_kind": "profile",
+                    "backend": "torch",
+                    "trace_health": trace_health,
+                    "trace_files": trace_health["trace_files"],
+                    "fingerprints": fingerprints,
+                    "topology": plan.topology,
+                    "cleanup_status": cleanup_status,
+                    "errors": errors,
+                    "diagnostic_metrics": unified,
+                },
+            )
         _atomic_write_json(unified_path, unified)
         compatibility = _compatibility_report(
             unified,

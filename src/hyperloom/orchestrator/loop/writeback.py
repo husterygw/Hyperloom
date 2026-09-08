@@ -985,6 +985,12 @@ class WritebackCollaborator:
         """
         if not isinstance(result, dict):
             return False
+        if result.get("measurement_kind") == "profile":
+            return (
+                task_kind == "profile"
+                and result.get("status") == "succeeded"
+                and bool((result.get("trace_health") or {}).get("passed"))
+            )
         if task_kind == "baseline":
             # A baseline whose accuracy eval failed measured throughput but must
             # not anchor; route it to _handle_unpromotable_result for enablement.

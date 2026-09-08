@@ -616,6 +616,17 @@ def extract_benchmark_measurement(
         provenance labels).
     """
     report = report or {}
+    if (
+        report.get("measurement_kind") == "profile"
+        or (report.get("vllm_cuda") or {}).get("measurement_kind") == "profile"
+    ):
+        # Do not salvage a score from raw JSON adjacent to a profiled run.
+        return {
+            "measurement_kind": "profile",
+            "valid_measurement": False,
+            "reported_success": report.get("success"),
+            "nonfatal_warnings": [],
+        }
     throughput = report.get("throughput") or {}
     latency = report.get("latency") or {}
     ttft = latency.get("ttft") or {}
@@ -779,8 +790,28 @@ def _is_scriptable_measurement(result: dict[str, Any]) -> bool:
 
 
 def is_valid_measurement(result: dict[str, Any] | None) -> bool:
-    """Return whether a measurement reflects a usable benchmark result."""
-    if not isinstance(result, dict):
+    """Return whether a measurement reflects a usable benchmark result.
+
+    Serving measurements are valid with positive output throughput AND at
+    least one completed request. Scriptable measurements (e.g. xDiT diffusion)
+    have no serving request counter, so they are valid on positive output
+    throughput alone (images/sec); ``completed_requests`` is optional.
+
+    AgentX results additionally carry the scenario's own verdict. A run that
+    violated a scenario invariant (or was cancelled, or exceeded the
+    context-overflow limit) still produces plausible throughput -- on whatever
+    subset survived -- so throughput alone cannot tell it apart from a clean
+    run. The verdict is consulted only under ``HYPERLOOM_AGENTX``, and only when
+    the result actually carries one, so neither the synthetic path nor a
+    scriptable run is affected.
+
+    Args:
+        result (dict[str, Any] | None): The measurement dict to check.
+
+    Returns:
+        bool: ``True`` if the measurement is usable for selection.
+    """
+    if not isinstance(result, dict) or result.get("measurement_kind") == "profile":
         return False
     output_tput = to_float(result.get("output_throughput"))
     if output_tput is None or output_tput <= 0:

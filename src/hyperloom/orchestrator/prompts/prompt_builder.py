@@ -16,6 +16,8 @@ PolicyGate would deny. A blank phase renders every module.
 from __future__ import annotations
 
 import re
+from hyperloom.inference_optimizer.protocol.action_surfaces import target_capability_enabled
+
 from collections.abc import Iterable, Mapping
 from typing import Any
 from pathlib import Path
@@ -1128,7 +1130,7 @@ def default_enabled_actions(
             action
             for action in actions
             if (required := TARGET_CAPABILITY_ACTIONS.get(action)) is None
-            or bool(target_capabilities.get(required, False))
+            or target_capability_enabled(target_capabilities, required)
         ]
     return tuple(actions)
 

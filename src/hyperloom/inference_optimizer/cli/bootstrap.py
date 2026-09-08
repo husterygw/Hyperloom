@@ -262,7 +262,10 @@ def _seed_shared_state(
         framework=os.environ.get("FRAMEWORK", "sglang"),
         gpu_type=str(getattr(args, "gpu_type", None) or os.environ.get("GPU_TYPE", "")),
         target_id=str(getattr(args, "target", None) or os.environ.get("HYPERLOOM_TARGET", "amd_auto")),
-        target_capabilities=get_target(
+        optimization_level=str(getattr(args, "optimization_level", None) or "config"),
+        profile_backend=str(getattr(args, "profile_backend", None) or "torch"),
+        target_capabilities=getattr(args, "target_capabilities", None)
+        or get_target(
             str(getattr(args, "target", None) or os.environ.get("HYPERLOOM_TARGET", "amd_auto"))
         ).capabilities.to_dict(),
         hardware_fingerprint=dict(getattr(args, "hardware_fingerprint", None) or {}),

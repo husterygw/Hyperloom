@@ -38,6 +38,8 @@ class TargetCapabilities:
     sweep: bool = True
     report: bool = True
     profile: bool = True
+    roofline: bool = True
+    trace_analysis: bool = True
     source_patch: bool = True
     kernel_patch: bool = True
     quantization: bool = True
@@ -86,6 +88,8 @@ _NVIDIA_MVP = TargetCapabilities(
     sweep=True,
     report=True,
     profile=False,
+    roofline=False,
+    trace_analysis=False,
     source_patch=False,
     kernel_patch=False,
     quantization=False,
@@ -465,10 +469,38 @@ def configure_target_environment(
         os.environ[HARDWARE_FINGERPRINT_ENV] = json.dumps(dict(fingerprint), sort_keys=True)
 
 
+def effective_target_capabilities(target: TargetDescriptor, level: str = "config") -> dict[str, bool]:
+    """Grant only implemented, explicitly selected features for a new session."""
+    capabilities = target.capabilities.to_dict()
+    if target.runtime == "cuda":
+        if level not in ("config", "profile"):
+            raise TargetValidationError(f"NVIDIA optimization level {level!r} is not implemented")
+        capabilities["profile"] = level == "profile"
+    return capabilities
+
+
+def validate_profile_runtime(fingerprint: Mapping[str, Any]) -> None:
+    """Check installed vLLM's native torch profiling command surface."""
+    surface = fingerprint.get("vllm_cli", {})
+    if "--profiler-config" not in surface.get("server_flags", []):
+        raise TargetValidationError("NVIDIA profiling requires vLLM serve --profiler-config")
+    if "--profile" not in surface.get("bench_flags", []):
+        raise TargetValidationError("NVIDIA profiling requires vLLM bench serve --profile")
+
+
 def validate_target_arguments(args: Any, target: TargetDescriptor) -> None:
     """Apply deterministic target policy to parsed CLI arguments."""
+    level = getattr(args, "optimization_level", None)
+    backend = getattr(args, "profile_backend", None)
     if target.runtime != "cuda":
+        if level is not None or backend is not None:
+            raise TargetValidationError("--optimization-level and --profile-backend currently require a NVIDIA target")
         return
+    args.optimization_level = level or "config"
+    args.profile_backend = backend or "torch"
+    args.target_capabilities = effective_target_capabilities(target, args.optimization_level)
+    if args.profile_backend != "torch":
+        raise TargetValidationError("NVIDIA nsys profiling is not implemented; use --profile-backend torch")
     if int(getattr(args, "nodes", 1) or 1) != 1:
         raise TargetValidationError(f"target {target.target_id} is single-node only")
     framework = str(getattr(args, "framework", None) or "").strip().lower()

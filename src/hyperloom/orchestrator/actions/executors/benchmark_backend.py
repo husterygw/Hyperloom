@@ -158,7 +158,7 @@ class VllmCudaBackend:
         elif framework != "vllm":
             verdict["reason"] = f"framework {framework!r} is not vllm"
         elif bool((bench.get("profiler") or {}).get("torch_profiler", {}).get("enabled")):
-            verdict["reason"] = "torch_profiler is outside the NVIDIA MVP"
+            verdict["reason"] = "torch_profiler requires a dedicated server (incompatible with reuse)"
         else:
             verdict["eligible"] = True
         return verdict

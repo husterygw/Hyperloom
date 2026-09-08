@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import logging
 import os
+from hyperloom.inference_optimizer.protocol.action_surfaces import target_capability_enabled
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
@@ -823,7 +825,7 @@ class PolicyGate:
                 )
             ):
                 required = "source_patch"
-        if required is None or bool(capabilities.get(required, False)):
+        if required is None or target_capability_enabled(capabilities, required):
             return
         target_id = str(getattr(state, "target_id", "") or "unknown")
         raise PolicyDenied(

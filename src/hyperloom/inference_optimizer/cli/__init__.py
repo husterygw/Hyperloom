@@ -1541,10 +1541,12 @@ async def _run_optimize(args: argparse.Namespace) -> int:
         resolve_target,
         validate_nvidia_host,
         validate_target_arguments,
+        validate_profile_runtime,
     )
 
     persisted_target = ""
     persisted_hardware: dict[str, Any] = {}
+    _early_state = None
     if getattr(args, "resume_from", None):
         try:
             _early_state = SharedState.load_or_init(Path(args.resume_from).expanduser().resolve())
@@ -1562,8 +1564,21 @@ async def _run_optimize(args: argparse.Namespace) -> int:
         raise SystemExit(2)
     try:
         target = resolve_target(explicit_target or None, persisted=persisted_target)
+        if _early_state is not None and target.runtime == "cuda":
+            if not getattr(args, "max_hours_explicit", False) and _early_state.max_minutes > 0:
+                args.max_hours = _early_state.max_minutes / 60.0
+            for field, default in (("optimization_level", "config"), ("profile_backend", "torch")):
+                saved = getattr(_early_state, field, default)
+                requested = getattr(args, field, None)
+                if requested is not None and requested != saved:
+                    raise TargetValidationError(
+                        f"resume {field} conflict: session={saved!r}, requested={requested!r}; start a new session"
+                    )
+                setattr(args, field, saved)
         validate_target_arguments(args, target)
         hardware_fingerprint = validate_nvidia_host(target) if target.runtime == "cuda" else {}
+        if target.runtime == "cuda" and args.optimization_level == "profile":
+            validate_profile_runtime(hardware_fingerprint)
         if persisted_hardware and hardware_fingerprint:
             if persisted_hardware.get("sha256") != hardware_fingerprint.get("sha256"):
                 raise TargetValidationError(
@@ -1576,6 +1591,8 @@ async def _run_optimize(args: argparse.Namespace) -> int:
     args.target = target.target_id
     args.hardware_fingerprint = hardware_fingerprint
     print(f"Execution target : {target.target_id} ({target.runtime}, backend={target.benchmark_backend})")
+    if target.runtime == "cuda":
+        print(f"Optimization level: {args.optimization_level} (profile backend={args.profile_backend})")
 
     # Surface --nodes (CLI flag wins) before _preflight runs.
     nodes_resolved = max(1, int(args.nodes))

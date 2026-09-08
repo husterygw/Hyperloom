@@ -449,6 +449,8 @@ class SharedState(_RenderMixin, _ExploreStateMixin):
     # predating v7 migrate to amd_auto.
     target_id: str = "amd_auto"
     target_capabilities: dict[str, bool] = field(default_factory=dict)
+    optimization_level: str = "config"
+    profile_backend: str = "torch"
     hardware_fingerprint: dict[str, Any] = field(default_factory=dict)
     # Workload metadata mirrored from manifest.json at session start; resume re-exports env vars.
     tp: int = 0

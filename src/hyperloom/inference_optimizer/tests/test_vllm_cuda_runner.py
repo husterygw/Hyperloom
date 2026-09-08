@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
+import sys
+import types
 import json
 import os
 import sqlite3
 import subprocess
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +20,31 @@ import yaml
 from hyperloom.orchestrator.actions.executors import _workload_envs as workload_envs
 from hyperloom.orchestrator.actions.executors import benchmark_backend
 from hyperloom.orchestrator.actions.executors import vllm_cuda_runner as runner
+
+
+@pytest.fixture(autouse=True)
+def isolate_cuda_host_lock(tmp_path, monkeypatch):
+    from hyperloom.orchestrator.actions.executors import cuda_host_lock
+
+    monkeypatch.setattr(cuda_host_lock, "LOCK_PATH", tmp_path / "cuda-host.lock")
+
+
+def test_gpu_memory_sampler_records_per_gpu_summary(monkeypatch):
+    class _Info:
+        used = 2 * 1024 * 1024
+
+    fake = types.SimpleNamespace(
+        nvmlInit=lambda: None,
+        nvmlDeviceGetHandleByIndex=lambda index: index,
+        nvmlDeviceGetMemoryInfo=lambda _handle: _Info(),
+    )
+    monkeypatch.setitem(sys.modules, "pynvml", fake)
+    sampler = runner._GpuMemorySampler((0, 1), interval_sec=0.05)
+    sampler.start()
+    summary = sampler.stop()
+    assert summary["status"] == "collected"
+    assert summary["per_gpu"]["0"]["max_used_mib"] == 2.0
+    assert summary["per_gpu"]["1"]["samples"] >= 1
 
 
 @pytest.fixture(autouse=True)
