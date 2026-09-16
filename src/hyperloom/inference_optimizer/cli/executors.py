@@ -11,6 +11,8 @@ must not import ``cli`` (one-way dependency).
 
 from __future__ import annotations
 
+from hyperloom.inference_optimizer.target_registry import is_cuda_target
+
 import argparse
 import logging
 import os
@@ -266,10 +268,7 @@ def _register_executors(
         specialist_executor: Optional specialist executor to register.
     """
     for kind, fn in _REAL_EXECUTORS_FULL.items():
-        if (
-            kind == "profile"
-            and getattr(coordinator.shared_state, "target_id", "amd_auto") == "nvidia_rtx4090_8x_local"
-        ):
+        if kind == "profile" and is_cuda_target(getattr(coordinator.shared_state, "target_id", "amd_auto")):
             from hyperloom.orchestrator.actions.executors.cuda_profile import CudaProfileExecutor
 
             fn = CudaProfileExecutor(session_dir=session_dir, shared_state=coordinator.shared_state)
@@ -297,7 +296,7 @@ def _register_executors(
 
     # roofline (profile + trace_analyze): auto-enqueued at PRELUDE + each 10%
     # watermark crossing, so always registered.
-    if getattr(coordinator.shared_state, "target_id", "amd_auto") == "nvidia_rtx4090_8x_local":
+    if is_cuda_target(getattr(coordinator.shared_state, "target_id", "amd_auto")):
         from hyperloom.orchestrator.actions.executors.cuda_roofline import CudaRooflineExecutor
 
         roofline_executor = CudaRooflineExecutor(shared_state=coordinator.shared_state, session_dir=session_dir)

@@ -378,7 +378,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="GPUs per multi-node pod (Infera worker/prefill/decode or RayJob "
-        "head+workers). Defaults to 8 when omitted.",
+        "head+workers). CUDA single-node: cap the visible pool; defaults to its detected size. "
+        "Other targets default to 8.",
     )
     # Platform-owned, inert here.
     opt.add_argument("--mn-image", default=None, help=argparse.SUPPRESS)

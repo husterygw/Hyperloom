@@ -3,18 +3,16 @@
 
 """Execution-target registry and hardware contracts.
 
-Targets describe a complete runtime boundary (vendor, benchmark backend and
-capabilities).  They intentionally do not extend the AMD ``--gpu-type`` board
+Targets describe the GPU platform (vendor, runtime and capabilities).  They intentionally do not extend the AMD ``--gpu-type`` board
 enum: a CUDA host is a different execution target, not an AMD runner alias.
 """
 
 from __future__ import annotations
 
 import hashlib
-import importlib.metadata
 import json
 import os
-import re
+import shutil
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
@@ -26,7 +24,8 @@ TARGET_ENV = "HYPERLOOM_TARGET"
 TARGET_RUNTIME_ENV = "HYPERLOOM_TARGET_RUNTIME"
 HARDWARE_FINGERPRINT_ENV = "HYPERLOOM_HARDWARE_FINGERPRINT"
 DEFAULT_TARGET = "amd_auto"
-NVIDIA_LOCAL_TARGET = "nvidia_rtx4090_8x_local"
+NVIDIA_CUDA_TARGET = "nvidia_cuda"
+NVIDIA_LOCAL_TARGET = "nvidia_rtx4090_8x_local"  # Accepted legacy CLI/session alias.
 
 
 @dataclass(frozen=True)
@@ -56,15 +55,7 @@ class TargetDescriptor:
     target_id: str
     vendor: str
     runtime: str
-    benchmark_backend: str
     capabilities: TargetCapabilities
-    expected_gpu_name: str = ""
-    expected_gpu_count: int = 0
-    expected_compute_capability: str = ""
-    min_memory_mib: int = 0
-    required_vllm_server_flags: tuple[str, ...] = ()
-    required_vllm_bench_flags: tuple[str, ...] = ()
-    default_cuda_home: str = ""
     experimental: bool = False
 
 
@@ -96,62 +87,9 @@ _NVIDIA_MVP = TargetCapabilities(
     multinode=False,
 )
 
-# The CUDA runner owns these flags and cannot operate safely without them.
-# Compatibility is determined by the installed CLI surface, not by an exact
-# vLLM package version: vLLM releases can advance while retaining this contract.
-VLLM_CUDA_REQUIRED_SERVER_FLAGS = (
-    "--host",
-    "--port",
-    "--served-model-name",
-    "--tensor-parallel-size",
-    "--pipeline-parallel-size",
-    "--max-model-len",
-)
-VLLM_CUDA_REQUIRED_BENCH_FLAGS = (
-    "--backend",
-    "--base-url",
-    "--endpoint",
-    "--model",
-    "--tokenizer",
-    "--dataset-name",
-    "--random-input-len",
-    "--random-output-len",
-    "--num-prompts",
-    "--num-warmups",
-    "--max-concurrency",
-    "--request-rate",
-    "--ignore-eos",
-    "--percentile-metrics",
-    "--metric-percentiles",
-    "--save-result",
-    "--result-dir",
-    "--result-filename",
-    "--disable-tqdm",
-)
-
 _TARGETS: dict[str, TargetDescriptor] = {
-    DEFAULT_TARGET: TargetDescriptor(
-        target_id=DEFAULT_TARGET,
-        vendor="amd",
-        runtime="rocm",
-        benchmark_backend="magpie",
-        capabilities=_ALL,
-    ),
-    NVIDIA_LOCAL_TARGET: TargetDescriptor(
-        target_id=NVIDIA_LOCAL_TARGET,
-        vendor="nvidia",
-        runtime="cuda",
-        benchmark_backend="vllm_cuda",
-        capabilities=_NVIDIA_MVP,
-        expected_gpu_name="NVIDIA GeForce RTX 4090",
-        expected_gpu_count=8,
-        expected_compute_capability="8.9",
-        min_memory_mib=24000,
-        required_vllm_server_flags=VLLM_CUDA_REQUIRED_SERVER_FLAGS,
-        required_vllm_bench_flags=VLLM_CUDA_REQUIRED_BENCH_FLAGS,
-        default_cuda_home="/usr/local/cuda-13.0",
-        experimental=True,
-    ),
+    DEFAULT_TARGET: TargetDescriptor(DEFAULT_TARGET, "amd", "rocm", _ALL),
+    NVIDIA_CUDA_TARGET: TargetDescriptor(NVIDIA_CUDA_TARGET, "nvidia", "cuda", _NVIDIA_MVP, experimental=True),
 }
 
 
@@ -161,12 +99,14 @@ class TargetValidationError(RuntimeError):
 
 def target_names() -> tuple[str, ...]:
     """Return registered target ids in stable order."""
-    return tuple(_TARGETS)
+    return (*_TARGETS, NVIDIA_LOCAL_TARGET)
 
 
 def get_target(target_id: str) -> TargetDescriptor:
     """Resolve a target id or raise a useful error."""
     key = str(target_id or "").strip().lower() or DEFAULT_TARGET
+    if key == NVIDIA_LOCAL_TARGET:
+        key = NVIDIA_CUDA_TARGET
     try:
         return _TARGETS[key]
     except KeyError as exc:
@@ -306,163 +246,187 @@ def _nvidia_driver_version() -> str:
 
 def _nvcc_release(cuda_home: Path) -> str:
     nvcc = cuda_home / "bin" / "nvcc"
-    if not nvcc.is_file():
-        raise TargetValidationError(f"CUDA compiler not found at {nvcc}")
+    try:
+        proc = subprocess.run([str(nvcc), "--version"], capture_output=True, text=True, timeout=10, check=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise TargetValidationError(f"cannot execute CUDA compiler {nvcc}: {exc}") from exc
+    return proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
+
+
+def discover_cuda_toolkit() -> dict[str, str]:
+    """Compiler discovery is diagnostic; serving does not require nvcc."""
+    explicit = os.environ.get("CUDA_HOME", "").strip()
+    nvcc = shutil.which("nvcc")
+    root = (
+        Path(explicit).expanduser()
+        if explicit
+        else (Path(nvcc).resolve().parent.parent if nvcc else Path("/usr/local/cuda"))
+    )
+    result = {"cuda_home": str(root.resolve()) if explicit or root.is_dir() else "", "nvcc": ""}
+    if (root / "bin" / "nvcc").is_file():
+        try:
+            result["nvcc"] = _nvcc_release(root)
+        except TargetValidationError as exc:
+            result["toolkit_error"] = str(exc)
+    return result
+
+
+# Probe the CUDA driver in a fresh process: importing a framework must not fix
+# the parent's device enumeration before the final visibility mask is chosen.
+_CUDA_ENUMERATOR = r"""
+import ctypes, json, uuid
+cuda = ctypes.CDLL("libcuda.so.1")
+def check(code):
+    if code:
+        raise RuntimeError("CUDA driver error %s" % code)
+check(cuda.cuInit(0))
+count = ctypes.c_int()
+version = ctypes.c_int()
+check(cuda.cuDeviceGetCount(ctypes.byref(count)))
+check(cuda.cuDriverGetVersion(ctypes.byref(version)))
+rows = []
+for ordinal in range(count.value):
+    device = ctypes.c_int()
+    check(cuda.cuDeviceGet(ctypes.byref(device), ordinal))
+    identity = (ctypes.c_ubyte * 16)()
+    uuid_fn = getattr(cuda, "cuDeviceGetUuid_v2", cuda.cuDeviceGetUuid)
+    check(uuid_fn(ctypes.byref(identity), device))
+    rows.append({"uuid": "GPU-" + str(uuid.UUID(bytes=bytes(identity))), "cuda_index": ordinal})
+print(json.dumps({"devices": rows, "cuda_driver_api_version": version.value}))
+"""
+
+
+def probe_cuda_devices(*, unmasked: bool = False) -> dict[str, Any]:
+    env = dict(os.environ)
+    if unmasked:
+        env.pop("CUDA_VISIBLE_DEVICES", None)
     try:
         proc = subprocess.run(
-            [str(nvcc), "--version"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
+            [sys.executable, "-c", _CUDA_ENUMERATOR], env=env, capture_output=True, text=True, timeout=30, check=True
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise TargetValidationError(f"cannot execute CUDA compiler {nvcc}: {exc}") from exc
-    text = f"{proc.stdout}\n{proc.stderr}"
-    if proc.returncode != 0 or "release 13.0" not in text:
-        raise TargetValidationError(f"{nvcc} is not the required CUDA 13.0 compiler (rc={proc.returncode})")
-    return text.strip().splitlines()[-1] if text.strip() else "CUDA 13.0"
+        return json.loads(proc.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        detail = getattr(exc, "stderr", "") or str(exc)
+        raise TargetValidationError(f"CUDA device enumeration failed: {detail}") from exc
 
 
-def _probe_vllm_cli_flags(*subcommand: str) -> set[str]:
-    """Return long options exposed by one installed vLLM CLI command.
+def select_cuda_devices(rows: list[dict[str, Any]], mask: str) -> list[dict[str, Any]]:
+    """Resolve a CUDA mask against actual driver ordinals/UUIDs, never NVML indices."""
+    if not mask.strip() or mask.strip() == "-1":
+        return []
+    selected = []
+    for token in mask.split(","):
+        token = token.strip()
+        if token.startswith("MIG-"):
+            raise TargetValidationError("MIG partition scheduling is not implemented")
+        if token.isdecimal():
+            matches = [r for r in rows if r["cuda_index"] == int(token)]
+        elif token.startswith("GPU-"):
+            matches = [r for r in rows if r["uuid"].startswith(token)]
+        else:
+            matches = []
+        if len(matches) != 1:
+            raise TargetValidationError(f"invalid or ambiguous CUDA_VISIBLE_DEVICES entry: {token!r}")
+        if any(r["uuid"] == matches[0]["uuid"] for r in selected):
+            raise TargetValidationError("CUDA_VISIBLE_DEVICES contains duplicate devices")
+        selected.append(matches[0])
+    return selected
 
-    Recent vLLM releases group most serving flags by config class, so the
-    probe uses ``--help=all``. It runs through ``sys.executable`` to verify the
-    exact interpreter that will launch the CUDA runner.
-    """
-    command = [sys.executable, "-m", "vllm.entrypoints.cli.main", *subcommand, "--help=all"]
-    try:
-        proc = subprocess.run(command, capture_output=True, text=True, timeout=90, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        rendered = " ".join(command)
-        raise TargetValidationError(f"cannot probe vLLM CLI ({rendered}): {exc}") from exc
-    output = f"{proc.stdout}\n{proc.stderr}"
-    if proc.returncode != 0:
-        detail = output.strip()[-1000:]
+
+def allocate_cuda_devices(
+    fingerprint: Mapping[str, Any], world_size: int, mask: str | None = None
+) -> list[dict[str, Any]]:
+    pool = fingerprint.get("devices") or []
+    if not pool or any("cuda_index" not in r for r in pool):
+        raise TargetValidationError("CUDA pool is missing validated ordinal/UUID mapping; repeat preflight")
+    selected = pool
+    if mask is not None:
+        selected = select_cuda_devices(fingerprint.get("cuda_devices") or pool, mask)
+        allowed = {r["uuid"]: r for r in pool}
+        if any(r["uuid"] not in allowed for r in selected):
+            raise TargetValidationError("candidate CUDA_VISIBLE_DEVICES escapes the allowed GPU pool")
+        selected = [allowed[r["uuid"]] for r in selected]
+    if world_size <= 0 or len(selected) < world_size:
         raise TargetValidationError(
-            f"vLLM CLI probe failed for {' '.join(subcommand)} (rc={proc.returncode}): {detail}"
+            f"CUDA_VISIBLE_DEVICES pool has {len(selected)} devices but TP*PP requires {world_size}"
         )
-    flags = set(re.findall(r"(?<![A-Za-z0-9_-])(--[a-z0-9][a-z0-9-]*)", output))
-    if not flags:
-        raise TargetValidationError(f"vLLM CLI probe returned no long options for {' '.join(subcommand)}")
-    return flags
+    selected = selected[:world_size]
+    if len({r["compute_capability"] for r in selected}) != 1:
+        raise TargetValidationError("cross-architecture CUDA parallel execution is not implemented")
+    return selected
 
 
-def _validate_vllm_cli(target: TargetDescriptor) -> dict[str, list[str]]:
-    """Verify the command surface required by the native CUDA runner."""
-    server_flags = _probe_vllm_cli_flags("serve")
-    bench_flags = _probe_vllm_cli_flags("bench", "serve")
-    missing_server = sorted(set(target.required_vllm_server_flags) - server_flags)
-    missing_bench = sorted(set(target.required_vllm_bench_flags) - bench_flags)
-    errors: list[str] = []
-    if missing_server:
-        errors.append("vLLM serve is missing required flag(s): " + ", ".join(missing_server))
-    if missing_bench:
-        errors.append("vLLM bench serve is missing required flag(s): " + ", ".join(missing_bench))
-    if errors:
-        raise TargetValidationError("; ".join(errors))
-    return {"server_flags": sorted(server_flags), "bench_flags": sorted(bench_flags)}
-
-
-def validate_nvidia_host(target: TargetDescriptor) -> dict[str, Any]:
-    """Fail closed unless the current interpreter and host match ``target``."""
+def validate_nvidia_host(target: TargetDescriptor, *, capacity: int | None = None) -> dict[str, Any]:
+    """Discover a usable CUDA pool independently of any inference framework."""
     if target.runtime != "cuda":
         return {}
-    devices = discover_nvidia_devices()
-    errors: list[str] = []
-    if len(devices) != target.expected_gpu_count:
-        errors.append(f"expected {target.expected_gpu_count} GPUs, found {len(devices)}")
-    for device in devices:
-        if device.name != target.expected_gpu_name:
-            errors.append(f"GPU {device.index} is {device.name!r}, expected {target.expected_gpu_name!r}")
-        if device.compute_capability != target.expected_compute_capability:
-            errors.append(
-                f"GPU {device.index} compute capability is {device.compute_capability}, "
-                f"expected {target.expected_compute_capability}"
-            )
-        if device.memory_mib < target.min_memory_mib:
-            errors.append(
-                f"GPU {device.index} memory is {device.memory_mib} MiB, expected at least {target.min_memory_mib} MiB"
-            )
-    torch_version = ""
-    torch_cuda_version = ""
-    nccl_version = ""
-    try:
-        import torch
-
-        torch_version = str(torch.__version__)
-        torch_cuda_version = str(torch.version.cuda or "")
-        try:
-            nccl_version = str(torch.cuda.nccl.version() or "")
-        except Exception:  # noqa: BLE001 - version metadata is diagnostic
-            nccl_version = ""
-        if not torch.cuda.is_available():
-            errors.append("torch.cuda.is_available() is false")
-        elif int(torch.cuda.device_count()) != target.expected_gpu_count:
-            errors.append(f"torch sees {torch.cuda.device_count()} GPUs, expected {target.expected_gpu_count}")
-    except ImportError:
-        errors.append("torch is not importable from the selected interpreter")
-    try:
-        vllm_version = importlib.metadata.version("vllm")
-    except importlib.metadata.PackageNotFoundError:
-        vllm_version = ""
-    vllm_cli: dict[str, list[str]] = {}
-    if not vllm_version:
-        errors.append("vLLM is not installed in the selected interpreter")
-    else:
-        try:
-            vllm_cli = _validate_vllm_cli(target)
-        except TargetValidationError as exc:
-            errors.append(str(exc))
-
-    explicit_cuda_home = str(os.environ.get("CUDA_HOME") or "").strip()
-    cuda_home = Path(explicit_cuda_home or target.default_cuda_home).expanduser().resolve()
-    try:
-        nvcc_version = _nvcc_release(cuda_home)
-    except TargetValidationError as exc:
-        errors.append(str(exc))
-        nvcc_version = ""
-    if errors:
-        raise TargetValidationError("NVIDIA target preflight failed:\n- " + "\n- ".join(errors))
-
-    fingerprint = build_hardware_fingerprint(target, devices)
-    fingerprint["cuda_home"] = str(cuda_home)
-    fingerprint["nvcc"] = nvcc_version
-    fingerprint["vllm_version"] = vllm_version
-    fingerprint["vllm_cli"] = vllm_cli
-    fingerprint["driver_version"] = _nvidia_driver_version()
-    fingerprint["torch_version"] = torch_version
-    fingerprint["torch_cuda_version"] = torch_cuda_version
-    fingerprint["nccl_version"] = nccl_version
-    _rehash_fingerprint(fingerprint)
-    return fingerprint
+    inventory = discover_nvidia_devices()
+    by_uuid = {device.uuid: asdict(device) for device in inventory}
+    unmasked = probe_cuda_devices(unmasked=True)
+    visible = probe_cuda_devices()
+    all_cuda = unmasked["devices"]
+    actual = visible["devices"]
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        expected = select_cuda_devices(all_cuda, os.environ["CUDA_VISIBLE_DEVICES"])
+        if [r["uuid"] for r in actual] != [r["uuid"] for r in expected]:
+            raise TargetValidationError("CUDA visibility does not match the requested device order")
+    if not actual:
+        raise TargetValidationError("NVIDIA target has no visible CUDA devices")
+    if capacity is not None and (capacity <= 0 or capacity > len(actual)):
+        raise TargetValidationError(f"GPU capacity {capacity} exceeds or invalidates visible pool of {len(actual)}")
+    base_indices = {r["uuid"]: r["cuda_index"] for r in all_cuda}
+    rows = []
+    for logical, device in enumerate(actual[:capacity]):
+        uuid = device["uuid"]
+        if uuid not in by_uuid:
+            raise TargetValidationError(f"CUDA device {uuid} has no physical NVML identity; MIG is not supported")
+        rows.append({**by_uuid[uuid], "cuda_index": base_indices[uuid], "logical_index": logical})
+    payload = build_hardware_fingerprint(target, inventory)
+    payload.update(
+        schema_version=2,
+        inventory=payload["devices"],
+        devices=rows,
+        cuda_devices=all_cuda,
+        visible_uuids=[r["uuid"] for r in actual],
+        cuda_driver_api_version=visible["cuda_driver_api_version"],
+        driver_version=_nvidia_driver_version(),
+        **discover_cuda_toolkit(),
+    )
+    _rehash_fingerprint(payload)
+    return payload
 
 
-def configure_target_environment(
-    target: TargetDescriptor,
-    *,
-    fingerprint: Mapping[str, Any] | None = None,
-) -> None:
-    """Publish the target contract to Hyperloom and its child processes."""
+def validate_resume_environment(saved: Mapping[str, Any], current: Mapping[str, Any]) -> None:
+    """Compare selected identities and software, not transient NVML ordinals."""
+
+    def identity(value: Mapping[str, Any]) -> dict[str, Any]:
+        rows = value.get("devices") or []
+        if not rows or any(not r.get("uuid") for r in rows):
+            raise TargetValidationError("Saved NVIDIA session lacks device identities; start a new session")
+        keys = ("uuid", "name", "compute_capability", "memory_mib", "pci_bus_id", "numa_node")
+        result = {"devices": [{k: r.get(k) for k in keys} for r in rows]}
+        for key in ("driver_version", "nvcc", "cuda_home"):
+            if key not in value:
+                raise TargetValidationError(f"Saved NVIDIA session lacks {key}; start a new session")
+            result[key] = value[key]
+        return result
+
+    if identity(saved) != identity(current):
+        raise TargetValidationError("NVIDIA device pool or execution environment changed; start a new session")
+
+
+def configure_target_environment(target: TargetDescriptor, *, fingerprint: Mapping[str, Any] | None = None) -> None:
+    """Publish platform identity and tool paths, without framework-specific policy."""
     os.environ[TARGET_ENV] = target.target_id
     os.environ[TARGET_RUNTIME_ENV] = target.runtime
     if target.runtime != "cuda":
         return
-    os.environ["HYPERLOOM_BENCHMARK_BACKEND"] = target.benchmark_backend
-    # The native CUDA runner already owns physical GPU leases and its complete
-    # server process group.  Wrapping it in the legacy single-node Ray serving
-    # actor loses the explicit CUDA_VISIBLE_DEVICES mapping and can fail before
-    # the runner starts when no Ray head exists.  This config-only target is
-    # single-node by contract, so keep benchmark execution local.
-    os.environ["INFERENCE_OPTIMIZER_RAY_EXEC"] = "0"
-    cuda_home = str((fingerprint or {}).get("cuda_home") or target.default_cuda_home)
-    os.environ["CUDA_HOME"] = cuda_home
-    cuda_bin = str(Path(cuda_home) / "bin")
-    path_parts = [part for part in os.environ.get("PATH", "").split(os.pathsep) if part]
-    os.environ["PATH"] = os.pathsep.join([cuda_bin, *[part for part in path_parts if part != cuda_bin]])
-    # Empty is an explicit allow-list: discover plugins for diagnostics but load none.
-    os.environ["VLLM_PLUGINS"] = ""
+    cuda_home = str((fingerprint or {}).get("cuda_home") or "")
+    if cuda_home:
+        os.environ["CUDA_HOME"] = cuda_home
+        cuda_bin = str(Path(cuda_home) / "bin")
+        path_parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p and p != cuda_bin]
+        os.environ["PATH"] = os.pathsep.join([cuda_bin, *path_parts])
     os.environ.pop("ROCR_VISIBLE_DEVICES", None)
     os.environ.pop("HIP_VISIBLE_DEVICES", None)
     if fingerprint:
@@ -481,25 +445,6 @@ def effective_target_capabilities(
         capabilities["trace_analysis"] = level == "profile" and backend == "nsys"
         capabilities["roofline"] = capabilities["trace_analysis"] and roofline
     return capabilities
-
-
-def validate_profile_runtime(
-    fingerprint: Mapping[str, Any], *, backend: str = "torch", roofline: bool = False
-) -> dict[str, Any]:
-    """Check installed vLLM's native torch profiling command surface."""
-    surface = fingerprint.get("vllm_cli", {})
-    if "--profiler-config" not in surface.get("server_flags", []):
-        raise TargetValidationError("NVIDIA profiling requires vLLM serve --profiler-config")
-    if "--profile" not in surface.get("bench_flags", []):
-        raise TargetValidationError("NVIDIA profiling requires vLLM bench serve --profile")
-    if backend == "nsys":
-        from hyperloom.orchestrator.actions.executors.cuda_nsight import tool_fingerprint
-
-        try:
-            return tool_fingerprint(roofline=roofline)
-        except (ValueError, OSError, subprocess.SubprocessError) as exc:
-            raise TargetValidationError(f"Nsight preflight failed: {exc}") from exc
-    return {}
 
 
 def validate_target_arguments(args: Any, target: TargetDescriptor) -> None:
@@ -521,15 +466,11 @@ def validate_target_arguments(args: Any, target: TargetDescriptor) -> None:
     )
     if int(getattr(args, "nodes", 1) or 1) != 1:
         raise TargetValidationError(f"target {target.target_id} is single-node only")
-    framework = str(getattr(args, "framework", None) or "").strip().lower()
-    if framework and framework != "vllm":
-        raise TargetValidationError(f"target {target.target_id} requires --framework vllm")
     if getattr(args, "gpu_type", None):
         raise TargetValidationError("--gpu-type is AMD-only and cannot be combined with a NVIDIA target")
     if getattr(args, "quantize", None) or str(getattr(args, "quantize_scheme", "") or "") not in ("", "none"):
-        raise TargetValidationError(f"target {target.target_id} does not support quantization in P0-P2")
+        raise TargetValidationError(f"target {target.target_id} does not support quantization")
 
-    args.framework = "vllm"
     args.no_kernel = True
     args.enable_roofline = args.target_capabilities["roofline"]
     # Keep OPTIMIZE enabled for config exploration. The source arm is marked
@@ -538,21 +479,19 @@ def validate_target_arguments(args: Any, target: TargetDescriptor) -> None:
     args.no_framework_local_explore = True
     args.enablement = "off"
     args.no_warm_replay = True
-    args.no_eval = True
 
 
 __all__ = [
     "DEFAULT_TARGET",
-    "HARDWARE_FINGERPRINT_ENV",
+    "NVIDIA_CUDA_TARGET",
     "NVIDIA_LOCAL_TARGET",
+    "HARDWARE_FINGERPRINT_ENV",
     "NvidiaDevice",
     "TARGET_ENV",
     "TARGET_RUNTIME_ENV",
     "TargetCapabilities",
     "TargetDescriptor",
     "TargetValidationError",
-    "VLLM_CUDA_REQUIRED_BENCH_FLAGS",
-    "VLLM_CUDA_REQUIRED_SERVER_FLAGS",
     "build_hardware_fingerprint",
     "configure_target_environment",
     "discover_nvidia_devices",
@@ -562,4 +501,6 @@ __all__ = [
     "target_names",
     "validate_nvidia_host",
     "validate_target_arguments",
+    "validate_resume_environment",
+    "select_cuda_devices",
 ]

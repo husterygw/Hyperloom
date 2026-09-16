@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from hyperloom.inference_optimizer.target_registry import is_cuda_target
+
 import json
 import logging
 import os
@@ -1053,7 +1055,7 @@ def compute_roofline_breakdown_from_state(
         The decode ``RooflineBreakdown`` (``_EMPTY_BREAKDOWN`` on missing
         fields).
     """
-    if getattr(state, "target_id", "") == "nvidia_rtx4090_8x_local":
+    if is_cuda_target(getattr(state, "target_id", "")):
         return _EMPTY_BREAKDOWN  # Selected NCU kernels do not establish an end-to-end ceiling.
     runtime = resolve_runtime_workload(state, arm=arm)
     # Diffusion (xDiT) uses a distinct images/sec ceiling.

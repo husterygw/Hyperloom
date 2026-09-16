@@ -42,7 +42,7 @@ from . import bypass_engine, bypass_report
 
 
 SCHEMA_VERSION = "vllm_cuda_benchmark/v1"
-TARGET_ID = "nvidia_rtx4090_8x_local"
+TARGET_ID = "nvidia_cuda"
 QUALITY_SUITE_SMOKE = "smoke"
 QUALITY_SUITE_QWEN3_P3 = "qwen3_p3"
 _QUALITY_SUITES = frozenset({QUALITY_SUITE_SMOKE, QUALITY_SUITE_QWEN3_P3})
@@ -60,6 +60,7 @@ SUPPORTED_EXTRA_VLLM_FLAGS = frozenset(
         "--disable-cascade-attn",
         "--disable-custom-all-reduce",
         "--enable-chunked-prefill",
+        "--enable-layerwise-nvtx-tracing",
         "--enable-prefix-caching",
         "--enforce-eager",
         "--gpu-memory-utilization",
@@ -67,6 +68,10 @@ SUPPORTED_EXTRA_VLLM_FLAGS = frozenset(
         "--kv-cache-memory-bytes",
         "--max-num-batched-tokens",
         "--max-num-seqs",
+        "--numa-bind",
+        "--no-numa-bind",
+        "--numa-bind-cpus",
+        "--numa-bind-nodes",
         "--no-enable-chunked-prefill",
         "--no-enable-prefix-caching",
         "--safetensors-load-strategy",
@@ -212,6 +217,30 @@ def _int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _runtime_python(bench: dict[str, Any]) -> str:
+    """Return the explicitly selected vLLM interpreter for this benchmark."""
+    runtime = bench.get("runtime") or {}
+    configured = str(runtime.get("python") or "").strip() if isinstance(runtime, dict) else ""
+    if not configured:
+        return sys.executable
+    path = Path(configured).expanduser()
+    if not path.is_absolute() or not path.is_file() or not os.access(path, os.X_OK):
+        raise ValueError("benchmark.runtime.python must be an executable absolute path")
+    return str(path.resolve())
+
+
+def _runtime_pythonpath(bench: dict[str, Any]) -> str:
+    """Return an optional absolute source root prepended for vLLM children."""
+    runtime = bench.get("runtime") or {}
+    configured = str(runtime.get("pythonpath") or "").strip() if isinstance(runtime, dict) else ""
+    if not configured:
+        return ""
+    path = Path(configured).expanduser()
+    if not path.is_absolute() or not path.is_dir():
+        raise ValueError("benchmark.runtime.pythonpath must be an absolute directory")
+    return str(path.resolve())
+
+
 def _float(value: Any, default: float = 0.0) -> float:
     if isinstance(value, bool) or value is None:
         return default
@@ -317,20 +346,17 @@ def _tokenize_extra_args(envs: dict[str, Any]) -> list[str]:
 
 
 def _visible_indices(envs: dict[str, Any], world_size: int) -> tuple[int, ...]:
-    raw = str(envs.get("CUDA_VISIBLE_DEVICES") or os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
-    if not raw:
-        return tuple(range(world_size))
-    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    from hyperloom.inference_optimizer.target_registry import allocate_cuda_devices, TargetValidationError
+
     try:
-        indices = tuple(int(part) for part in parts)
-    except ValueError as exc:
-        raise ValueError("vllm_cuda MVP requires integer CUDA_VISIBLE_DEVICES indices") from exc
-    if len(indices) < world_size:
-        raise ValueError(f"CUDA_VISIBLE_DEVICES has {len(indices)} devices but TP*PP requires {world_size}")
-    selected = indices[:world_size]
-    if any(index < 0 for index in selected) or len(set(selected)) != len(selected):
-        raise ValueError("CUDA_VISIBLE_DEVICES must contain unique non-negative device indices")
-    return selected
+        selected = allocate_cuda_devices(
+            _hardware_payload(),
+            world_size,
+            str(envs["CUDA_VISIBLE_DEVICES"]) if "CUDA_VISIBLE_DEVICES" in envs else None,
+        )
+    except TargetValidationError as exc:
+        raise ValueError(str(exc)) from exc
+    return tuple(r["index"] for r in selected)
 
 
 def _hardware_payload() -> dict[str, Any]:
@@ -514,30 +540,104 @@ def _qwen3_p3_cases() -> tuple[dict[str, Any], ...]:
             "language": "zh",
             "length": "short",
             "enable_thinking": True,
-            "content": "请用一句中文说明光合作用的作用。",
+            "max_tokens": 512,
+            "semantic_groups": (
+                ("光合作用",),
+                ("二氧化碳",),
+                ("水",),
+                ("氧气",),
+                ("糖", "有机物", "葡萄糖"),
+            ),
+            "content": ("请用一句中文说明光合作用：必须明确写出它使用二氧化碳和水，生成有机物和氧气。"),
         },
         {
             "id": "en_short_no_thinking",
             "language": "en",
             "length": "short",
             "enable_thinking": False,
-            "content": "Answer in one English sentence: what does photosynthesis do?",
+            "max_tokens": 64,
+            "semantic_groups": (
+                ("photosynthesis",),
+                ("carbon dioxide",),
+                ("water",),
+                ("oxygen",),
+                ("sugar", "glucose"),
+            ),
+            "content": (
+                "Answer in one English sentence what photosynthesis does. "
+                "Explicitly include carbon dioxide, water, sugar, and oxygen."
+            ),
         },
         {
             "id": "cn_long_no_thinking",
             "language": "zh",
             "length": "long",
             "enable_thinking": False,
-            "content": f"{cn_context}\n\n只用一句中文总结上述资料。",
+            "max_tokens": 64,
+            "semantic_groups": (
+                ("二氧化碳",),
+                ("水",),
+                ("氧气",),
+                ("糖", "有机物", "葡萄糖"),
+            ),
+            "content": f"{cn_context}\n\n只用一句中文总结上述资料，且明确写出二氧化碳、水、有机物和氧气。",
         },
         {
             "id": "en_long_thinking",
             "language": "en",
             "length": "long",
             "enable_thinking": True,
-            "content": f"{en_context}\n\nGive a one-sentence English summary of the background.",
+            "max_tokens": 512,
+            "semantic_groups": (
+                ("carbon dioxide",),
+                ("water",),
+                ("oxygen",),
+                ("sugar", "glucose"),
+            ),
+            "content": (
+                f"{en_context}\n\nGive a one-sentence English summary of the background. "
+                "Explicitly include carbon dioxide, water, sugar, and oxygen."
+            ),
         },
     )
+
+
+def _qwen3_p3_semantic_checks(spec: dict[str, Any], completion: str) -> dict[str, Any]:
+    """Validate P3's factual answer contract without treating a nonempty reply as correct."""
+    normalized = " ".join(completion.casefold().split())
+    final_answer = normalized
+    answer_source = "completion"
+    if "<think>" in normalized:
+        if "</think>" not in normalized:
+            # Qwen3 can spend the entire bounded completion budget in a
+            # well-formed reasoning prefix. It is still a semantic response;
+            # validate its factual content and mark that provenance explicitly.
+            final_answer = normalized.split("<think>", 1)[1].strip()
+            answer_source = "thinking_prefix"
+        else:
+            final_answer = normalized.split("</think>", 1)[1].strip()
+            answer_source = "final_answer"
+    if not final_answer:
+        return {"passed": False, "reason": "empty_final_answer", "final_answer": "", "matched_terms": []}
+
+    groups = tuple(tuple(str(term).casefold() for term in group) for group in spec["semantic_groups"])
+    matched_terms: list[str] = []
+    missing_groups: list[list[str]] = []
+    for group in groups:
+        matched = next((term for term in group if term in final_answer), None)
+        if matched is None:
+            missing_groups.append(list(group))
+        else:
+            matched_terms.append(matched)
+    return {
+        "passed": not missing_groups,
+        "reason": "" if not missing_groups else "missing_required_semantic_terms",
+        "final_answer": final_answer,
+        "answer_source": answer_source,
+        "matched_terms": matched_terms,
+        "missing_groups": missing_groups,
+        "required_groups": [list(group) for group in groups],
+    }
 
 
 def _qwen3_p3_quality_gate(
@@ -588,7 +688,7 @@ def _qwen3_p3_quality_gate(
             payload={
                 "model": served_model_name,
                 "prompt": prompt,
-                "max_tokens": 32,
+                "max_tokens": int(spec["max_tokens"]),
                 "temperature": 0,
             },
             timeout=90,
@@ -596,6 +696,41 @@ def _qwen3_p3_quality_gate(
         completion = _completion_text(payload)
         if not completion:
             raise RuntimeError(f"qwen3_p3 case {spec['id']} returned an empty completion")
+        semantic_checks = _qwen3_p3_semantic_checks(spec, completion)
+        if not semantic_checks["passed"]:
+            failed_metadata = {
+                "id": spec["id"],
+                "language": spec["language"],
+                "length": spec["length"],
+                "enable_thinking": bool(spec["enable_thinking"]),
+                "input_tokens": input_tokens,
+                "response_chars": len(completion),
+                "semantic_checks": semantic_checks,
+                "passed": False,
+            }
+            artifacts.append(
+                {
+                    **failed_metadata,
+                    "prompt": prompt,
+                    "completion": completion,
+                    "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                    "completion_sha256": hashlib.sha256(completion.encode("utf-8")).hexdigest(),
+                }
+            )
+            _atomic_write_json(
+                artifact_path,
+                {
+                    "schema_version": "vllm_cuda_quality/v1",
+                    "suite": QUALITY_SUITE_QWEN3_P3,
+                    "model": model,
+                    "cases": artifacts,
+                    "passed": False,
+                },
+            )
+            raise RuntimeError(
+                f"qwen3_p3 case {spec['id']} failed semantic checks: {semantic_checks['reason']} "
+                f"{semantic_checks.get('missing_groups', [])}"
+            )
         metadata = {
             "id": spec["id"],
             "language": spec["language"],
@@ -603,6 +738,7 @@ def _qwen3_p3_quality_gate(
             "enable_thinking": bool(spec["enable_thinking"]),
             "input_tokens": input_tokens,
             "response_chars": len(completion),
+            "semantic_checks": semantic_checks,
             "passed": True,
         }
         summaries.append(metadata)
@@ -838,15 +974,32 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
     """Run one YAML-configured vLLM CUDA benchmark."""
     target_id = os.environ.get("HYPERLOOM_TARGET", "").strip()
     target_runtime = os.environ.get("HYPERLOOM_TARGET_RUNTIME", "").strip().lower()
-    if target_id != TARGET_ID or target_runtime != "cuda":
+    from hyperloom.inference_optimizer.target_registry import get_target, is_cuda_target
+
+    if not is_cuda_target(target_id) or target_runtime != "cuda":
         raise ValueError(
             f"vllm_cuda runner requires HYPERLOOM_TARGET={TARGET_ID!r} and HYPERLOOM_TARGET_RUNTIME='cuda'"
         )
+    target_id = get_target(target_id).target_id
     hardware_payload = _hardware_payload()
-    if hardware_payload.get("target_id") != target_id or not hardware_payload.get("sha256"):
+    if get_target(hardware_payload.get("target_id", "")).target_id != target_id or not hardware_payload.get("sha256"):
         raise ValueError("vllm_cuda runner requires the validated NVIDIA hardware fingerprint")
     cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     bench = cfg.get("benchmark") or {}
+    runtime_python = _runtime_python(bench)
+    runtime_pythonpath = _runtime_pythonpath(bench)
+    if runtime_python != hardware_payload.get(
+        "runtime_python", sys.executable
+    ) or runtime_pythonpath != hardware_payload.get("runtime_pythonpath", ""):
+        from .vllm_cuda_preflight import validate_execution_stack
+
+        checked = validate_execution_stack(hardware_payload, python_exe=runtime_python, pythonpath=runtime_pythonpath)
+        from hyperloom.inference_optimizer.target_registry import validate_resume_environment
+
+        validate_resume_environment(hardware_payload, checked)
+        # Record the environment that will actually execute this task.
+        hardware_payload = checked
+        os.environ["HYPERLOOM_HARDWARE_FINGERPRINT"] = json.dumps(checked, sort_keys=True)
     envs = dict(bench.get("envs") or {})
     if str(bench.get("framework") or "").lower() != "vllm":
         raise ValueError("vllm_cuda runner requires benchmark.framework=vllm")
@@ -898,7 +1051,12 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
     client_stderr_path = workspace / "client_stderr.log"
 
     child_env = build_benchmark_env(envs)
-    child_env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in gpu_ids)
+    if runtime_pythonpath:
+        inherited_pythonpath = child_env.get("PYTHONPATH", "")
+        child_env["PYTHONPATH"] = (
+            f"{runtime_pythonpath}{os.pathsep}{inherited_pythonpath}" if inherited_pythonpath else runtime_pythonpath
+        )
+    child_env["CUDA_VISIBLE_DEVICES"] = ",".join(hardware_rows[gpu_id]["uuid"] for gpu_id in gpu_ids)
     child_env["VLLM_PLUGINS"] = ""
     child_env.pop("ROCR_VISIBLE_DEVICES", None)
     child_env.pop("HIP_VISIBLE_DEVICES", None)
@@ -906,7 +1064,7 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
     if quality_suite not in _QUALITY_SUITES:
         raise ValueError(f"unsupported vLLM CUDA quality suite {quality_suite!r}")
     server_argv = [
-        sys.executable,
+        runtime_python,
         "-m",
         "vllm.entrypoints.cli.main",
         "serve",
@@ -926,7 +1084,7 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
         *_tokenize_extra_args(envs),
     ]
     benchmark_argv = [
-        sys.executable,
+        runtime_python,
         "-m",
         "vllm.entrypoints.cli.main",
         "bench",
@@ -978,7 +1136,7 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
         if external_profile:
             profiler_config = {"profiler": "cuda", "detailed_trace_annotation": True}
             if profile_backend == "ncu":
-                profiler_config["max_iterations"] = int(cuda_profiler.get("max_iterations", 4))
+                profiler_config["max_iterations"] = int(cuda_profiler.get("max_iterations", 0))
                 profiler_config["delay_iterations"] = int(cuda_profiler.get("delay_iterations", 0))
         server_argv.extend(["--profiler-config", json.dumps(profiler_config)])
         benchmark_argv.append("--profile")
@@ -1010,6 +1168,8 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
             "pp": pp,
             "world_size": world_size,
             "gpu_indices": list(gpu_ids),
+            "cuda_indices": [hardware_rows[gpu_id]["cuda_index"] for gpu_id in gpu_ids],
+            "logical_indices": list(range(world_size)),
             "gpu_uuids": [str(hardware_rows[gpu_id].get("uuid") or "") for gpu_id in gpu_ids],
             "numa_nodes": [hardware_rows[gpu_id].get("numa_node") for gpu_id in gpu_ids],
         },
@@ -1018,7 +1178,8 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
         server_argv=server_argv,
         benchmark_argv=benchmark_argv,
         child_env={
-            key: child_env.get(key, "") for key in ("CUDA_VISIBLE_DEVICES", "CUDA_HOME", "PATH", "VLLM_PLUGINS")
+            key: child_env.get(key, "")
+            for key in ("CUDA_VISIBLE_DEVICES", "CUDA_HOME", "PATH", "PYTHONPATH", "VLLM_PLUGINS")
         },
         artifacts={
             "workspace": str(workspace),
@@ -1030,12 +1191,38 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
         },
         fingerprints=fingerprints,
     )
+    ncu_worker_filter = None
     if external_profile:
-        from .cuda_nsight import profiler_argv, tool_fingerprint
+        from .cuda_nsight import roofline_metrics, profiler_argv, tool_fingerprint, query_roofline_metrics
 
         fingerprints["profiler_tools"] = tool_fingerprint(
             roofline=profile_backend == "ncu", expected=cuda_profiler.get("tools")
         )
+        ncu_devices = cuda_profiler.get("devices")
+        if profile_backend == "ncu" and ncu_devices is None:
+            # NCU's default all-device scope can stall graph replay even when
+            # CUDA_VISIBLE_DEVICES restricts the serving process to one GPU.
+            ncu_devices = list(range(world_size))
+        if any(d not in range(world_size) for d in ncu_devices or []):
+            raise ValueError("ncu profiling device is outside the leased CUDA_VISIBLE_DEVICES")
+        worker_rank = cuda_profiler.get("worker_rank")
+        if profile_backend == "ncu" and worker_rank is not None:
+            from .cuda_profiler_launch import prepare_worker_filter
+
+            if worker_rank not in range(world_size) or len(cuda_profiler.get("devices") or []) != 1:
+                raise ValueError("ncu worker filtering requires one leased device and a valid worker rank")
+            ncu_worker_filter = prepare_worker_filter(workspace, worker_rank)
+        metric_selection = None
+        if profile_backend == "ncu":
+            names = cuda_profiler.get("kernel_names") or [str(cuda_profiler.get("kernel_name") or "")]
+            metric_selection = query_roofline_metrics(
+                names,
+                [plan.topology["gpu_uuids"][d] for d in ncu_devices],
+                executable=fingerprints["profiler_tools"]["ncu"]["path"],
+            )
+            _atomic_write_json(workspace / "ncu_metric_selection.json", metric_selection)
+            if "gpu__time_duration.sum" not in metric_selection["selected"]:
+                raise ValueError("Nsight Compute duration counters unavailable for the sampled GPU")
         # The launcher publishes the actual serving PID/group before exec.
         server_argv = profiler_argv(
             profile_backend,
@@ -1049,8 +1236,32 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
             workspace,
             str(cuda_profiler.get("kernel_name") or ""),
             tool_paths=fingerprints["profiler_tools"],
+            devices=ncu_devices,
+            process_name=ncu_worker_filter["process_name"] if ncu_worker_filter else None,
+            kernel_names=cuda_profiler.get("kernel_names"),
+            metrics=metric_selection["selected"] if metric_selection is not None else None,
         )
         plan = replace(plan, server_argv=server_argv)
+        if profile_backend == "ncu":
+            _atomic_write_json(
+                workspace / "ncu_capture_policy.json",
+                {
+                    "schema_version": 1,
+                    "window": "native_benchmark_start_stop",
+                    "delay_iterations": profiler_config["delay_iterations"],
+                    "max_iterations": profiler_config["max_iterations"],
+                    "launch_limit_per_kernel_per_gpu": 1 if ncu_worker_filter else 3,
+                    "devices": ncu_devices,
+                    "worker_filter": ncu_worker_filter,
+                    "kernel_name": cuda_profiler.get("kernel_name"),
+                    "kernel_names": cuda_profiler.get("kernel_names") or [str(cuda_profiler.get("kernel_name"))],
+                    "metrics": list(
+                        roofline_metrics(cuda_profiler.get("kernel_names") or [str(cuda_profiler.get("kernel_name"))])
+                    ),
+                    "argv": server_argv,
+                    "tools": fingerprints["profiler_tools"],
+                },
+            )
     _atomic_write_json(workspace / "launch_plan.json", asdict(plan))
     (workspace / "benchmark_config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
 
@@ -1078,6 +1289,7 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
                 "port": port,
                 "model": served_model_name,
                 "metadata": ownership_metadata,
+                "ncu_worker_filter": ncu_worker_filter,
             },
         )
     start = time.time()
@@ -1093,6 +1305,7 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
     profile_stopped = False
     analysis_result: dict[str, Any] = {}
     workers: list[dict[str, Any]] = []
+    ncu_progress = None
 
     def cleanup_profile_processes() -> None:
         if profile_enabled:
@@ -1100,6 +1313,9 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
 
             for owner in ("serving", "profiler"):
                 teardown_lifecycle_server(pid_dir=workspace / owner, framework="vllm", port=port)
+            from .cuda_profiler_launch import cleanup_profile_workers
+
+            cleanup_profile_workers(workspace)
 
     try:
         reuse = lifecycle_enabled and pid_dir and bypass_engine.server_health_ok(base_url)
@@ -1150,11 +1366,14 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
             if not _wait_ready(base_url, timeout_s=ready_timeout_s, proc=server_proc):
                 tail = ""
                 try:
-                    tail = server_log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+                    tail = server_log_path.read_text(encoding="utf-8", errors="replace")
                 except OSError:
                     pass
-                reason = "server_ready_timeout"
-                if "out of memory" in tail.lower() or "cuda oom" in tail.lower():
+                reason = "server_exited_before_ready" if server_proc.poll() is not None else "server_ready_timeout"
+                if any(
+                    text in tail.lower()
+                    for text in ("out of memory", "cuda oom", "less than desired gpu memory utilization")
+                ):
                     reason = "server_cuda_oom"
                 raise RuntimeError(reason)
         if external_profile:
@@ -1163,6 +1382,10 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
             serving_pid = int((workspace / "serving" / f"vllm_{port}.pid").read_text().split()[0])
             workers = rank_processes(plan.topology, serving_pid, server_log_path)
             _atomic_write_json(workspace / "rank_processes.json", {"workers": workers})
+            if ncu_worker_filter:
+                selected_worker = next(w for w in workers if w["rank"] == ncu_worker_filter["rank"])
+                if Path(f"/proc/{selected_worker['pid']}/exe").resolve() != Path(ncu_worker_filter["executable"]):
+                    raise RuntimeError("ncu_worker_process_filter_not_applied")
         _verify_model(base_url, served_model_name)
         quality_gate = _quality_smoke(
             base_url,
@@ -1171,6 +1394,11 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
             quality_suite=quality_suite,
             artifact_path=quality_cases_path,
         )
+        if profile_backend == "ncu":
+            from .cuda_nsight import NcuProgress
+
+            ncu_progress = NcuProgress(workspace)
+            ncu_progress.start()
         with (
             client_stdout_path.open("w", encoding="utf-8") as stdout,
             client_stderr_path.open("w", encoding="utf-8") as stderr,
@@ -1213,6 +1441,9 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
                 # terminate the wrapper's group before its report is complete.
                 teardown_lifecycle_server(pid_dir=workspace / "serving", framework="vllm", port=port)
                 server_proc.wait(timeout=180)
+                from .cuda_profiler_launch import cleanup_profile_workers
+
+                cleanup_profile_workers(workspace)
                 report = workspace / ("capture.nsys-rep" if profile_backend == "nsys" else "capture.ncu-rep")
                 if not report.is_file() or report.stat().st_mtime < start or report.stat().st_size == 0:
                     raise RuntimeError("missing_or_stale_nsight_report")
@@ -1262,7 +1493,12 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
                                 timeout=120,
                                 check=True,
                             )
-                        trace_health = analyze_ncu(csv_path, workers, str(cuda_profiler["kernel_name"]))
+                        trace_health = analyze_ncu(
+                            csv_path,
+                            workers,
+                            str(cuda_profiler.get("kernel_name") or ""),
+                            kernel_names=cuda_profiler.get("kernel_names"),
+                        )
                         trace_health["trace_files"].insert(0, str(report))
             else:
                 from .cuda_profile import validate_cuda_traces
@@ -1315,6 +1551,8 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
         cleanup_profile_processes()
         if server_log is not None:
             server_log.close()
+        if ncu_progress is not None:
+            ncu_progress.stop()
         if not persistent:
             _terminate_group(server_proc)
             _release_gpu_lease(lease)
@@ -1331,6 +1569,8 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
             gpu_memory=gpu_memory,
         )
         if profile_enabled:
+            from .cuda_nsight import capture_failure
+
             unified["measurement_kind"] = "profile"
             _atomic_write_json(
                 workspace / "vllm_cuda_profile.json",
@@ -1346,6 +1586,13 @@ def _run_benchmark(config_path: Path, output_dir: Path) -> int:
                     "topology": plan.topology,
                     "cleanup_status": cleanup_status,
                     "errors": errors,
+                    "capture_failure": capture_failure(errors, server_log_path.read_text(errors="replace"))
+                    if profile_backend == "ncu" and server_log_path.exists()
+                    else None,
+                    "capture_policy_path": str(workspace / "ncu_capture_policy.json")
+                    if profile_backend == "ncu"
+                    else None,
+                    "progress_path": str(workspace / "ncu_progress.jsonl") if profile_backend == "ncu" else None,
                     "diagnostic_metrics": unified,
                 },
             )

@@ -381,7 +381,7 @@ def _load_kernel_agent_env_fallback() -> dict[str, Any]:
             return {
                 "status": "skipped",
                 "skip_reason": "target_capability_disabled",
-                "detail": {"target_id": target_id, "vars_loaded": 0, "env_file": None},
+                "detail": {"target_id": get_target(target_id).target_id, "vars_loaded": 0, "env_file": None},
             }
     candidate = os.environ.get("KERNEL_AGENT_ENV")
     if not candidate:
@@ -1040,11 +1040,7 @@ def _check_serving_framework(args, benchmark_python: str) -> dict[str, Any]:
     interpreters = _framework_probe_interpreters(framework, benchmark_python)
     if (os.environ.get("HYPERLOOM_TARGET_RUNTIME") or "").strip().lower() == "cuda":
         found = next(
-            (
-                python_exe
-                for python_exe in interpreters
-                if _framework_importable(framework, python_exe).verdict is True
-            ),
+            (python_exe for python_exe in interpreters if _framework_importable(framework, python_exe).verdict is True),
             None,
         )
         if found:
@@ -2253,7 +2249,9 @@ def _preflight(
             install_event,
             step_id="check_gpu_visibility",
             category="check",
-            action=lambda: validate_nvidia_host(get_target(getattr(args, "target", "") or "nvidia_rtx4090_8x_local")),
+            action=lambda: validate_nvidia_host(
+                get_target(getattr(args, "target", "") or "nvidia_cuda"), capacity=getattr(args, "gpus_per_node", None)
+            ),
         )
     else:
         _unset_hip_visible_devices()

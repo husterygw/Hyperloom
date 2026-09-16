@@ -187,9 +187,22 @@ class VllmCudaBackend:
         ]
 
 
+def select_platform_backend(runtime: str, framework: str, requested: str = "") -> str:
+    """Resolve implemented platform/framework combinations before dispatch."""
+    if runtime != "cuda":
+        return requested if requested in KNOWN_BENCHMARK_BACKENDS else DEFAULT_BENCHMARK_BACKEND
+    if framework not in ("", "vllm") or requested not in ("", "vllm_cuda"):
+        from hyperloom.inference_optimizer.target_registry import TargetValidationError
+
+        raise TargetValidationError(f"No CUDA execution backend for framework={framework!r}, backend={requested!r}")
+    return "vllm_cuda"
+
+
 def resolve_backend_name() -> str:
     """Resolve the active backend name from the environment."""
     raw = (os.environ.get(BENCHMARK_BACKEND_ENV) or "").strip().lower()
+    if os.environ.get("HYPERLOOM_TARGET_RUNTIME") == "cuda":
+        return select_platform_backend("cuda", "vllm", raw)
     if not raw or raw not in KNOWN_BENCHMARK_BACKENDS:
         return DEFAULT_BENCHMARK_BACKEND
     return raw

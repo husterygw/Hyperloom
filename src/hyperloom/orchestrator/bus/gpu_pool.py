@@ -83,6 +83,14 @@ def resolve_gpu_specialist_devices(
     cap = max(0, int(capacity or 0))
     if cap <= 0:
         return []
+    if os.environ.get("HYPERLOOM_TARGET_RUNTIME", "").strip().lower() == "cuda":
+        pool = [device.index for device in resolve_whole_machine_devices()]
+        explicit = _explicit_pool()
+        if explicit is not None:
+            if not set(explicit).issubset(pool):
+                raise ValueError("specialist devices escape the validated CUDA pool")
+            return explicit[:cap]
+        return pool[max(0, int(serving_tp or 0)) :][:cap]
     explicit = _explicit_pool()
     if explicit is not None:
         return explicit[:cap]
@@ -121,7 +129,7 @@ def resolve_whole_machine_devices() -> list[int | GpuDeviceRef]:
 
             fingerprint = json.loads(os.environ.get("HYPERLOOM_HARDWARE_FINGERPRINT", "") or "{}")
             rows = fingerprint.get("devices") if isinstance(fingerprint, dict) else None
-            if isinstance(rows, list) and rows:
+            if isinstance(rows, list):
                 return [
                     GpuDeviceRef(
                         index=int(row["index"]),
@@ -132,7 +140,8 @@ def resolve_whole_machine_devices() -> list[int | GpuDeviceRef]:
                     if isinstance(row, dict) and "index" in row
                 ]
         except (TypeError, ValueError, json.JSONDecodeError):
-            log.warning("invalid HYPERLOOM_HARDWARE_FINGERPRINT; falling back to CUDA indices")
+            raise ValueError("invalid validated CUDA device pool; repeat preflight")
+        raise ValueError("missing validated CUDA device pool; repeat preflight")
     explicit = _explicit_pool()
     if explicit is not None:
         return explicit

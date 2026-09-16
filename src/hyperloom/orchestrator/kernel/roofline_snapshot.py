@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from hyperloom.inference_optimizer.target_registry import is_cuda_target
+
 import logging
 import os
 import re
@@ -188,7 +190,7 @@ def attach_perfmodel_breakdown(snapshot: dict[str, Any], state: Any, *, arm: str
 
     Best-effort and in place: any failure leaves *snapshot* untouched.
     """
-    if getattr(state, "target_id", "") == "nvidia_rtx4090_8x_local":
+    if is_cuda_target(getattr(state, "target_id", "")):
         snapshot["roofline_provenance"] = {
             "backend": "nsys/ncu",
             "scope": "selected kernels",

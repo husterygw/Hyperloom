@@ -8,18 +8,144 @@ No serving scores are produced here. All timings refer to instrumented runs.
 
 from __future__ import annotations
 
+from hyperloom.inference_optimizer.target_registry import is_cuda_target
+
 import csv
 from bisect import bisect_right
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import sqlite3
 import subprocess
+import threading
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+
+
+# Explicit counters keep roofline arithmetic without collecting unrelated
+# section metrics (which previously caused 16 replay passes per launch).
+ROOFLINE_METRICS = (
+    "gpu__time_duration.sum",
+    "dram__bytes.sum.per_second",
+    "dram__bytes.sum.peak_sustained",
+    "dram__cycles_elapsed.avg.per_second",
+    "sm__ops_path_tensor_src_bf16_dst_fp32_sparsity_off.sum.per_second",
+    "sm__ops_path_tensor_src_bf16_dst_fp32_sparsity_off.sum.peak_sustained_elapsed.per_second",
+    "smsp__sass_thread_inst_executed_op_fadd_pred_on.sum.per_cycle_elapsed",
+    "smsp__sass_thread_inst_executed_op_fmul_pred_on.sum.per_cycle_elapsed",
+    "smsp__sass_thread_inst_executed_op_ffma_pred_on.sum.per_cycle_elapsed",
+    "smsp__cycles_elapsed.avg.per_second",
+    "sm__sass_thread_inst_executed_op_ffma_pred_on.sum.peak_sustained",
+    "sm__cycles_elapsed.avg.per_second",
+    "profiler__replayer_passes",
+    "profiler__replayer_bytes_mem_accessible.avg",
+    "profiler__replayer_bytes_mem_backed_up.avg",
+    "device__attribute_pci_bus_id",
+)
+
+
+def roofline_metrics(names: list[str]) -> tuple[str, ...]:
+    # BF16 tensor GEMM families do not need scalar instruction counters. The
+    # measured tensor rate must still be positive before producing a point.
+    if names and all(re.search(r"bf16|bfloat16", n) and re.search(r"gemm|tensorop", n) for n in names):
+        return tuple(m for m in ROOFLINE_METRICS if not m.startswith("smsp__") and "sass_thread" not in m)
+    return ROOFLINE_METRICS
+
+
+def query_roofline_metrics(names: list[str], gpu_uuids: list[str], *, executable: str = "ncu") -> dict[str, Any]:
+    """Intersect counters supported by the actual sampled devices/tool version."""
+    desired = roofline_metrics(names)
+    available: set[str] | None = None
+    errors = []
+    for uuid in gpu_uuids:
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": uuid}
+        metrics = set()
+        # Device identity and replay diagnostics are separate NCU collections,
+        # not hardware counters. Query them too before declaring them absent.
+        for collection in ("profiling", "device", "stats"):
+            command = [executable, "--query-metrics", "--query-metrics-mode", "all", "--devices", "0"]
+            if collection != "profiling":
+                command += ["--query-metrics-collection", collection]
+            proc = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60, check=False)
+            if proc.returncode:
+                if collection == "profiling":
+                    raise ValueError(f"ncu metrics query failed for {uuid}: {proc.stderr.strip()}")
+                errors.append(f"{uuid}/{collection}: {proc.stderr.strip()}")
+                continue
+            metrics.update(re.findall(r"[a-z][a-z0-9_]*__[A-Za-z0-9_.]+", proc.stdout))
+        available = metrics if available is None else available & metrics
+    return {
+        "requested": list(desired),
+        "selected": [m for m in desired if m in (available or set())],
+        "unavailable": [m for m in desired if m not in (available or set())],
+        "gpu_uuids": gpu_uuids,
+        "query_errors": errors,
+    }
+
+
+class NcuProgress:
+    """Timestamp observed tool/endpoint progress without controlling capture."""
+
+    def __init__(self, workspace: Path):
+        self.workspace = workspace
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self._watch, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.done.set()
+        self.thread.join(timeout=2)
+
+    def _watch(self) -> None:
+        # The server log exists before the benchmark client starts. Recording
+        # chunks also preserves progress printed without a terminating newline.
+        try:
+            with (
+                (self.workspace / "server.log").open(errors="replace") as source,
+                (self.workspace / "ncu_progress.jsonl").open("a") as dest,
+            ):
+                while True:
+                    chunk = source.read(65536)
+                    if chunk:
+                        dest.write(json.dumps({"observed_at": time.time(), "log": chunk}) + "\n")
+                        dest.flush()
+                    elif self.done.wait(0.25):
+                        break
+        except OSError:
+            # Diagnostic logging must not prevent owned-process cleanup.
+            return
+
+
+def capture_failure(errors: list[str], log: str) -> str | None:
+    if not errors:
+        return None
+    detail = "\n".join(errors)
+    if "server_cuda_oom" in detail:
+        return "startup_gpu_memory"
+    if "server_exited_before_ready" in detail:
+        return "startup_exit"
+    if "server_ready_timeout" in detail:
+        return "startup_timeout"
+    if "RPC call to sample_tokens timed out" in log:
+        return "worker_rpc_timeout"
+    if "benchmark_timeout" in detail:
+        return "benchmark_timeout"
+    if "No kernels were profiled" in log or "no matched launches" in detail:
+        return "no_matching_launches"
+    if "benchmark_request_failure" in detail:
+        return "request_failure"
+    if "missing_or_stale_nsight_report" in detail:
+        return "missing_or_stale_report"
+    if "PCI identity" in detail or "process or kernel" in detail:
+        return "sample_identity_mismatch"
+    return "capture_failed"
 
 
 def tool_fingerprint(*, roofline: bool, expected: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -37,7 +163,16 @@ def tool_fingerprint(*, roofline: bool, expected: dict[str, Any] | None = None) 
 
 
 def profiler_argv(
-    backend: str, server: list[str], workspace: Path, kernel_name: str = "", *, tool_paths: dict[str, Any] | None = None
+    backend: str,
+    server: list[str],
+    workspace: Path,
+    kernel_name: str = "",
+    *,
+    tool_paths: dict[str, Any] | None = None,
+    devices: list[int] | None = None,
+    process_name: str | None = None,
+    kernel_names: list[str] | None = None,
+    metrics: list[str] | None = None,
 ) -> list[str]:
     executable = ((tool_paths or {}).get(backend) or {}).get("path") or backend
     if backend == "nsys":
@@ -56,12 +191,27 @@ def profiler_argv(
             str(workspace / "capture"),
             *server,
         ]
-    if backend != "ncu" or not kernel_name or is_communication(kernel_name):
+    names = kernel_names if kernel_names is not None else [kernel_name]
+    if backend != "ncu" or not names or any(not n or is_communication(n) for n in names):
         raise ValueError("ncu requires an explicit non-communication kernel")
+    if len(names) > 3 or len(set(names)) != len(names) or (len(names) > 1 and not process_name):
+        raise ValueError("ncu grouped capture requires one worker and at most three distinct kernels")
+    if devices is not None and (not devices or len(set(devices)) != len(devices) or any(d < 0 for d in devices)):
+        raise ValueError("ncu requires distinct non-negative devices")
+    name_pattern = (
+        "^" + (re.escape(names[0]) if len(names) == 1 else "(" + "|".join(re.escape(n) for n in names) + ")") + "$"
+    )
+    # Invocation counters are per unique kernel name. Encode namespace colons
+    # because NCU also uses them to delimit kernel-id fields.
+    identifier = "::regex:" + name_pattern.replace(":", r"\x3a") + ":1"
     return [
         executable,
+        "--config-file",
+        "off",
         "--target-processes",
         "all",
+        *(["--target-processes-filter", process_name] if process_name else []),
+        *(["--devices", ",".join(map(str, devices))] if devices is not None else []),
         "--profile-from-start",
         "off",
         "--nvtx",
@@ -74,19 +224,16 @@ def profiler_argv(
         "--kernel-name-base",
         "demangled",
         "--kernel-name",
-        "regex:^" + re.escape(kernel_name) + "$",
+        "regex:" + name_pattern,
         "--rename-kernels",
         "off",
         "--filter-mode",
         "per-gpu",
+        *(["--kernel-id", identifier] if len(names) > 1 else []),
         "--launch-count",
-        "3",
-        "--section",
-        "SpeedOfLight",
-        "--section",
-        "SpeedOfLight_RooflineChart",
-        "--section",
-        "SpeedOfLight_HierarchicalTensorRooflineChart",
+        str(len(names)) if process_name else "3",
+        "--metrics",
+        ",".join(metrics if metrics is not None else roofline_metrics(names)),
         "-o",
         str(workspace / "capture"),
         *server,
@@ -197,10 +344,13 @@ def analyze_nsys(database: Path, workers: list[dict[str, Any]], *, fingerprints:
         }
         by_pid = {r["pid"]: r for r in workers}
         ranges = defaultdict(list)
+        nvtx_scopes = defaultdict(list)
         if "NVTX_EVENTS" in tables:
             for raw in conn.execute("SELECT * FROM NVTX_EVENTS WHERE end > start"):
                 r = dict(raw)
                 name = r.get("text") or strings.get(r.get("textId"), "")
+                if name:
+                    nvtx_scopes[r["globalTid"]].append((r["start"], r["end"], name))
                 if "execute_" in name:
                     ranges[r["globalTid"]].append((r["start"], r["end"], phase_name(name)))
         # vLLM's profiler counts execute_model calls, including empty pipeline
@@ -209,23 +359,38 @@ def analyze_nsys(database: Path, workers: list[dict[str, Any]], *, fingerprints:
         for tid in ranges:
             ranges[tid].sort()
             range_starts[tid] = [r[0] for r in ranges[tid]]
+        for tid in nvtx_scopes:
+            nvtx_scopes[tid].sort()
+        nvtx_scope_starts = {tid: [entry[0] for entry in entries] for tid, entries in nvtx_scopes.items()}
         execution_starts = defaultdict(list)
         for tid, entries in ranges.items():
             execution_starts[(tid >> 24) << 24].extend(a for a, _, _ in entries)
         execution_starts = {pid: sorted(set(starts)) for pid, starts in execution_starts.items()}
         runtime = {}
-        if ranges and "CUPTI_ACTIVITY_KIND_RUNTIME" in tables:
+        if (ranges or nvtx_scopes) and "CUPTI_ACTIVITY_KIND_RUNTIME" in tables:
             for r in conn.execute("SELECT start,end,globalTid,correlationId FROM CUPTI_ACTIVITY_KIND_RUNTIME"):
                 pid_global = (r["globalTid"] >> 24) << 24
                 step = bisect_right(execution_starts.get(pid_global, []), r["start"])
-                runtime[(pid_global, r["correlationId"])] = ("unknown", step)
+                # The last range started before this runtime API is the
+                # innermost possible match. A range that has already ended
+                # cannot expose a useful operator attribution: layer scopes
+                # are sequential in a worker thread. Checking that one range
+                # keeps full-trace mapping O(log nvtx_scopes) per runtime API.
+                entries = nvtx_scopes.get(r["globalTid"], [])
+                scope_index = bisect_right(nvtx_scope_starts.get(r["globalTid"], []), r["start"]) - 1
+                scope = ""
+                if scope_index >= 0:
+                    scope_start, scope_end, scope_name = entries[scope_index]
+                    if scope_start <= r["start"] <= scope_end:
+                        scope = scope_name
+                runtime[(pid_global, r["correlationId"])] = ("unknown", step, scope)
                 # execute_model annotations are sequential on a worker thread.
                 # Binary search avoids scanning thousands of steps per API call.
                 index = bisect_right(range_starts.get(r["globalTid"], []), r["start"]) - 1
                 if index >= 0:
                     a, b, phase = ranges[r["globalTid"]][index]
                     if a <= r["start"] <= b:
-                        runtime[(pid_global, r["correlationId"])] = (phase, step)
+                        runtime[(pid_global, r["correlationId"])] = (phase, step, scope)
         kernels = []
         for raw in conn.execute("SELECT * FROM CUPTI_ACTIVITY_KIND_KERNEL WHERE end > start"):
             r = dict(raw)
@@ -244,8 +409,9 @@ def analyze_nsys(database: Path, workers: list[dict[str, Any]], *, fingerprints:
                     "name": name,
                     "start": r["start"],
                     "end": r["end"],
-                    "phase": runtime.get((r["globalPid"], r["correlationId"]), ("unknown", 0))[0],
-                    "step": runtime.get((r["globalPid"], r["correlationId"]), ("unknown", 0))[1],
+                    "phase": runtime.get((r["globalPid"], r["correlationId"]), ("unknown", 0, ""))[0],
+                    "step": runtime.get((r["globalPid"], r["correlationId"]), ("unknown", 0, ""))[1],
+                    "nvtx_scope": runtime.get((r["globalPid"], r["correlationId"]), ("unknown", 0, ""))[2],
                     "communication": is_communication(name),
                     "grid": [r[f"grid{x}"] for x in "XYZ"],
                     "block": [r[f"block{x}"] for x in "XYZ"],
@@ -299,6 +465,7 @@ def analyze_nsys(database: Path, workers: list[dict[str, Any]], *, fingerprints:
                     "ranks": set(),
                     "phases": set(),
                     "launches": set(),
+                    "nvtx_scope_time_ns": defaultdict(int),
                     "first_step_by_rank": {},
                     "reusable_native_kernel": False,
                 },
@@ -311,11 +478,15 @@ def analyze_nsys(database: Path, workers: list[dict[str, Any]], *, fingerprints:
             row["ranks"].add(k["rank"])
             row["phases"].add(k["phase"])
             row["launches"].add((k["rank"], tuple(k["grid"]), tuple(k["block"])))
+            if k["nvtx_scope"]:
+                row["nvtx_scope_time_ns"][k["nvtx_scope"]] += k["end"] - k["start"]
         hot = sorted(grouped.values(), key=lambda r: r["gpu_time_ns"], reverse=True)
         for row in hot:
             row["gpu_pct"] = 100 * row["gpu_time_ns"] / total
             row["ranks"], row["phases"] = sorted(row["ranks"]), sorted(row["phases"])
             row["launches"] = [{"rank": r, "grid": list(g), "block": list(b)} for r, g, b in sorted(row["launches"])]
+            row["nvtx_scope_time_ns"] = dict(sorted(row["nvtx_scope_time_ns"].items()))
+            row["nvtx_scopes"] = sorted(row["nvtx_scope_time_ns"])
         return {
             "schema_version": 1,
             "backend": "nsys",
@@ -326,7 +497,7 @@ def analyze_nsys(database: Path, workers: list[dict[str, Any]], *, fingerprints:
             "hot_kernels": hot,
             "counter_status": "not_requested",
             "window": {"start_ns": start, "end_ns": end},
-            "attribution": "native NVTX execution phases; layer identity unavailable for fused/graph kernels",
+            "attribution": "native NVTX execution phases with innermost runtime-call scope when available",
         }
     finally:
         conn.close()
@@ -396,6 +567,8 @@ def roofline_point(metrics: dict[str, Any]) -> dict[str, Any]:
 def ncu_export_argv(report: Path, *, nvtx: bool = False, executable: str = "ncu") -> list[str]:
     command = [
         executable,
+        "--config-file",
+        "off",
         "--import",
         str(report),
         "--page",
@@ -411,7 +584,10 @@ def ncu_export_argv(report: Path, *, nvtx: bool = False, executable: str = "ncu"
     return command
 
 
-def analyze_ncu(csv_path: Path, workers: list[dict[str, Any]], kernel_name: str) -> dict[str, Any]:
+def analyze_ncu(
+    csv_path: Path, workers: list[dict[str, Any]], kernel_name: str = "", *, kernel_names: list[str] | None = None
+) -> dict[str, Any]:
+    names = kernel_names if kernel_names is not None else [kernel_name]
     by_pid = {r["pid"]: r for r in workers}
     with csv_path.open(newline="") as stream:
         rows = list(csv.DictReader(stream))
@@ -429,7 +605,7 @@ def analyze_ncu(csv_path: Path, workers: list[dict[str, Any]], kernel_name: str)
     launches = []
     for row in rows[1:]:
         worker = by_pid.get(int(row["Process ID"]))
-        if worker is None or row["Kernel Name"] != kernel_name:
+        if worker is None or row["Kernel Name"] not in names:
             raise ValueError("NCU process or kernel does not match capture selection")
         if worker.get("pci_bus_id"):
             expected_bus = int(worker["pci_bus_id"].split(":")[-2], 16)
@@ -445,14 +621,23 @@ def analyze_ncu(csv_path: Path, workers: list[dict[str, Any]], kernel_name: str)
                 "grid": row["Grid Size"],
                 "block": row["Block Size"],
                 "metrics": row,
+                "replay": {
+                    "passes": number(row.get("profiler__replayer_passes")),
+                    "accessible_bytes_avg": number(row.get("profiler__replayer_bytes_mem_accessible.avg")),
+                    "backed_up_bytes_avg": number(row.get("profiler__replayer_bytes_mem_backed_up.avg")),
+                },
                 "ncu_roofline": roofline_point(row),
             }
         )
     if not launches:
         raise ValueError("NCU report has no matched launches")
+    if {r["kernel_name"] for r in launches} != set(names):
+        raise ValueError("NCU report is missing a selected kernel")
     counts = {rank: sum(r["rank"] == rank for r in launches) for rank in {r["rank"] for r in launches}}
-    if any(count > 3 for count in counts.values()):
-        raise ValueError("NCU launch count exceeded per-rank limit")
+    if any(
+        sum(r["rank"] == rank and r["kernel_name"] == name for r in launches) > 3 for rank in counts for name in names
+    ):
+        raise ValueError("NCU launch count exceeded per-kernel per-rank limit")
     return {
         "passed": True,
         "ranks": [{"rank": rank, "kernel_events": count} for rank, count in sorted(counts.items())],
@@ -496,13 +681,16 @@ def write_analysis(workspace: Path, summary: dict[str, Any]) -> dict[str, Any]:
         counter = row.get("ncu_roofline") or {}
         if not counter:
             continue
-        lines += ["", f"## Counter samples: {row['kernel_id']}", "", f"Artifact: {counter['profile_artifact']}"]
+        lines += ["", f"## Counter samples: {row['kernel_id']}"]
+        for artifact in counter.get("profile_artifacts") or [counter["profile_artifact"]]:
+            lines += ["", f"Artifact: {artifact}"]
         for launch in counter.get("launches", []):
             point = launch["ncu_roofline"]
             lines += [
                 "",
                 f"Rank {launch['rank']}, phase {launch.get('phase', 'unknown')}, "
                 f"grid {launch['grid']}, block {launch['block']}: `{json.dumps(point, ensure_ascii=False)}`",
+                f"Sample artifact: {launch.get('profile_artifact', counter.get('profile_artifact'))}",
             ]
     lines += [
         "",
@@ -528,7 +716,7 @@ def write_analysis(workspace: Path, summary: dict[str, Any]) -> dict[str, Any]:
 
 def report_summary(state: Any) -> dict[str, Any]:
     """Small persisted evidence reference, including for interrupted sessions."""
-    if getattr(state, "target_id", "") != "nvidia_rtx4090_8x_local" or getattr(state, "profile_backend", "") != "nsys":
+    if not is_cuda_target(getattr(state, "target_id", "")) or getattr(state, "profile_backend", "") != "nsys":
         return {}
     analysis = getattr(state, "last_trace_analyze", {}) or {}
     if not analysis.get("analysis_md_path"):

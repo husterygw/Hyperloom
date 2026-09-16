@@ -116,9 +116,7 @@ def resolve_specialist_agent_backend(env: Mapping[str, str] | None = None) -> st
     from hyperloom.common import llm_config  # local import: keep module import-light
 
     return (
-        AGENT_BACKEND_CODEX
-        if llm_config.is_openai_only(env) or codex_cli_auth_requested(env)
-        else AGENT_BACKEND_CLAUDE
+        AGENT_BACKEND_CODEX if llm_config.is_openai_only(env) or codex_cli_auth_requested(env) else AGENT_BACKEND_CLAUDE
     )
 
 
@@ -1000,14 +998,27 @@ class SpecialistSubprocessDispatcher:
                 env["INFERENCE_OPTIMIZER_SPECIALIST_GPU_IDS"] = ",".join(str(g) for g in gpu_ids)
         elif gpu_ids:
             visible = ",".join(str(g) for g in gpu_ids)
-            env["HIP_VISIBLE_DEVICES"] = visible
-            env["CUDA_VISIBLE_DEVICES"] = visible
-            env["ROCR_VISIBLE_DEVICES"] = visible
+            if os.environ.get("HYPERLOOM_TARGET_RUNTIME") == "cuda":
+                from ..bus.gpu_pool import resolve_whole_machine_devices
+
+                pool = {device.index: device.uuid for device in resolve_whole_machine_devices()}
+                if any(g not in pool for g in gpu_ids):
+                    raise ValueError("specialist allocation escapes the validated CUDA pool")
+                env["CUDA_VISIBLE_DEVICES"] = ",".join(pool[g] for g in gpu_ids)
+                env.pop("HIP_VISIBLE_DEVICES", None)
+                env.pop("ROCR_VISIBLE_DEVICES", None)
+            else:
+                env["HIP_VISIBLE_DEVICES"] = visible
+                env["CUDA_VISIBLE_DEVICES"] = visible
+                env["ROCR_VISIBLE_DEVICES"] = visible
             env["INFERENCE_OPTIMIZER_SPECIALIST_GPU_IDS"] = visible
         else:
             # CPU specialists must not inherit serving GPU visibility.
             for var in GPU_MASK_ENV_NAMES:
                 env.pop(var, None)
+
+        if not gpu_ids and gpu_lease is None and os.environ.get("HYPERLOOM_TARGET_RUNTIME") == "cuda":
+            env["CUDA_VISIBLE_DEVICES"] = ""
 
         log_fh: Any = None
         proc_started: float

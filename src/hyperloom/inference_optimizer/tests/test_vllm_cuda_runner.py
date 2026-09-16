@@ -65,6 +65,8 @@ def _hardware() -> dict:
         "devices": [
             {
                 "index": index,
+                "cuda_index": index,
+                "logical_index": index,
                 "uuid": f"GPU-{index:02d}",
                 "name": "NVIDIA GeForce RTX 4090",
                 "memory_mib": 24564,
@@ -81,7 +83,11 @@ def _cuda_env(monkeypatch, tmp_path: Path, *, visible: str = "0") -> Path:
     session_dir = tmp_path / "session"
     monkeypatch.setenv("HYPERLOOM_TARGET", runner.TARGET_ID)
     monkeypatch.setenv("HYPERLOOM_TARGET_RUNTIME", "cuda")
-    monkeypatch.setenv("HYPERLOOM_HARDWARE_FINGERPRINT", json.dumps(_hardware()))
+    hardware = _hardware()
+    hardware["cuda_devices"] = [{"uuid": r["uuid"], "cuda_index": r["cuda_index"]} for r in hardware["devices"]]
+    indices = [int(i) for i in visible.split(",") if i]
+    hardware["devices"] = [hardware["devices"][i] for i in indices]
+    monkeypatch.setenv("HYPERLOOM_HARDWARE_FINGERPRINT", json.dumps(hardware))
     monkeypatch.setenv("INFERENCE_OPTIMIZER_CURRENT_SESSION_DIR", str(session_dir))
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
     monkeypatch.setenv("CUDA_HOME", "/usr/local/cuda-13.0")
@@ -189,14 +195,16 @@ def test_normalize_fails_closed_on_request_quality_or_cleanup_failure(raw_overri
     assert report["status"] == "failed"
 
 
-def test_visible_device_selection_fails_closed_on_short_duplicate_or_symbolic(monkeypatch):
+def test_visible_device_selection_checks_pool_and_supports_uuid(monkeypatch):
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("HYPERLOOM_HARDWARE_FINGERPRINT", json.dumps(_hardware()))
     assert runner._visible_indices({"CUDA_VISIBLE_DEVICES": "4,5,6,7"}, 4) == (4, 5, 6, 7)
     with pytest.raises(ValueError, match=r"TP\*PP"):
         runner._visible_indices({"CUDA_VISIBLE_DEVICES": "0,1"}, 4)
-    with pytest.raises(ValueError, match="unique"):
+    with pytest.raises(ValueError, match="duplicate"):
         runner._visible_indices({"CUDA_VISIBLE_DEVICES": "0,0"}, 2)
-    with pytest.raises(ValueError, match="integer"):
+    assert runner._visible_indices({"CUDA_VISIBLE_DEVICES": "GPU-04"}, 1) == (4,)
+    with pytest.raises(ValueError, match="invalid or ambiguous"):
         runner._visible_indices({"CUDA_VISIBLE_DEVICES": "GPU-a"}, 1)
 
 
@@ -238,7 +246,24 @@ def test_qwen3_p3_quality_suite_persists_the_semantic_matrix(tmp_path, monkeypat
             return FakeTokenizer()
 
     monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoTokenizer=FakeAutoTokenizer))
-    monkeypatch.setattr(runner, "_json_request", lambda *args, **kwargs: {"choices": [{"text": "ok"}]})
+
+    def _reply(*args, **kwargs):
+        prompt = kwargs["payload"]["prompt"]
+        english = "Answer in one English" in prompt or "Background" in prompt
+        if "thinking=True" in prompt:
+            if english:
+                text = (
+                    "<think>reasoning</think> Photosynthesis converts water and carbon dioxide into sugar and oxygen."
+                )
+            else:
+                text = "<think>推理</think> 光合作用把二氧化碳和水转化为有机物并释放氧气。"
+        elif english:
+            text = "Photosynthesis uses water and carbon dioxide to make sugar and oxygen."
+        else:
+            text = "光合作用把二氧化碳和水转化为有机物并释放氧气。"
+        return {"choices": [{"text": text}]}
+
+    monkeypatch.setattr(runner, "_json_request", _reply)
     artifact = tmp_path / "quality_cases.json"
 
     gate = runner._qwen3_p3_quality_gate(
@@ -257,7 +282,50 @@ def test_qwen3_p3_quality_suite_persists_the_semantic_matrix(tmp_path, monkeypat
         ("zh", "long", False),
         ("en", "long", True),
     }
-    assert all(row["completion"] == "ok" for row in persisted["cases"])
+    assert all(row["semantic_checks"]["passed"] is True for row in persisted["cases"])
+
+
+def test_qwen3_p3_rejects_nonempty_but_semantically_incomplete_answer(tmp_path, monkeypatch):
+    model = tmp_path / "qwen3"
+    model.mkdir()
+    (model / "config.json").write_text('{"model_type":"qwen3"}', encoding="utf-8")
+
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, enable_thinking):
+            return str(messages[0]["content"])
+
+        def __call__(self, prompt, *, add_special_tokens):
+            return {"input_ids": list(range(160 if "背景资料" in prompt or "Background" in prompt else 16))}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoTokenizer=SimpleNamespace(from_pretrained=lambda *args, **kwargs: FakeTokenizer())),
+    )
+    monkeypatch.setattr(runner, "_json_request", lambda *args, **kwargs: {"choices": [{"text": "植物很重要。"}]})
+
+    artifact = tmp_path / "quality_cases.json"
+    with pytest.raises(RuntimeError, match="failed semantic checks"):
+        runner._qwen3_p3_quality_gate(
+            "http://127.0.0.1:1",
+            "model",
+            str(model),
+            artifact_path=artifact,
+        )
+    persisted = json.loads(artifact.read_text(encoding="utf-8"))
+    assert persisted["passed"] is False
+    assert persisted["cases"][0]["completion"] == "植物很重要。"
+    assert persisted["cases"][0]["semantic_checks"]["missing_groups"]
+
+
+def test_qwen3_p3_accepts_a_semantically_complete_thinking_prefix():
+    spec = runner._qwen3_p3_cases()[0]
+    checks = runner._qwen3_p3_semantic_checks(
+        spec,
+        "<think>光合作用把二氧化碳和水转化为有机物，并释放氧气。",
+    )
+    assert checks["passed"] is True
+    assert checks["answer_source"] == "thinking_prefix"
 
 
 def test_gpu_lease_persists_uuid_and_numa_and_is_idempotent(tmp_path, monkeypatch):
@@ -310,7 +378,7 @@ def test_cuda_materialization_uses_tp_times_pp_and_removes_amd_surface(tmp_path,
     bench = yaml.safe_load(rendered_path.read_text(encoding="utf-8"))["benchmark"]
     assert bench["envs"]["TP"] == 1
     assert bench["envs"]["PP"] == 8
-    assert bench["envs"]["CUDA_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
+    assert bench["envs"]["CUDA_VISIBLE_DEVICES"] == ",".join(f"GPU-{i:02d}" for i in range(8))
     assert "ROCR_VISIBLE_DEVICES" not in bench["envs"]
     assert "HIP_VISIBLE_DEVICES" not in bench["envs"]
     assert "runner_type" not in bench
@@ -375,7 +443,7 @@ def test_full_runner_lifecycle_writes_launch_and_compatibility_artifacts(tmp_pat
     assert compatibility["output_throughput_per_gpu"] == 10.0
 
 
-@pytest.mark.parametrize("failure", ["timeout", "bad_json", "server_crash", "oom"])
+@pytest.mark.parametrize("failure", ["timeout", "bad_json", "server_crash", "oom", "insufficient_free_memory"])
 def test_runner_faults_fail_closed_and_release_lease(tmp_path, monkeypatch, failure):
     session_dir = _cuda_env(monkeypatch, tmp_path, visible="0")
     monkeypatch.setattr(runner, "_pick_port", lambda: 18081)
@@ -388,9 +456,17 @@ def test_runner_faults_fail_closed_and_release_lease(tmp_path, monkeypatch, fail
             if failure == "oom" and stdout is not None:
                 stdout.write("CUDA out of memory\n")
                 stdout.flush()
+            if failure == "insufficient_free_memory" and stdout is not None:
+                stdout.write("Free memory on device cuda:0 is less than desired GPU memory utilization\n")
+                stdout.write("subsequent teardown detail\n" * 300)
+                stdout.flush()
 
     monkeypatch.setattr(runner.subprocess, "Popen", FaultServer)
-    monkeypatch.setattr(runner, "_wait_ready", lambda *args, **kwargs: failure not in {"server_crash", "oom"})
+    monkeypatch.setattr(
+        runner,
+        "_wait_ready",
+        lambda *args, **kwargs: failure not in {"server_crash", "oom", "insufficient_free_memory"},
+    )
 
     def fake_client(argv, **kwargs):
         if failure == "timeout":
@@ -408,6 +484,10 @@ def test_runner_faults_fail_closed_and_release_lease(tmp_path, monkeypatch, fail
     unified = json.loads((workspace / "vllm_cuda_benchmark.json").read_text(encoding="utf-8"))
     assert unified["status"] == "failed"
     assert unified["failure_reason"]
+    if failure in {"oom", "insufficient_free_memory"}:
+        assert "server_cuda_oom" in unified["failure_reason"]
+    if failure == "server_crash":
+        assert "server_exited_before_ready" in unified["failure_reason"]
     assert unified["cleanup_status"] == "released"
     with sqlite3.connect(session_dir / "storage" / "coordinator.db") as conn:
         assert conn.execute("SELECT COUNT(*) FROM gpu_leases").fetchone()[0] == 0
@@ -472,3 +552,35 @@ def test_lifecycle_requires_an_ownership_directory(tmp_path, monkeypatch):
     monkeypatch.setattr(runner.subprocess, "Popen", lambda *a, **kw: pytest.fail("server launched"))
     with pytest.raises(ValueError, match="requires pid_dir"):
         runner.run_benchmark(path, tmp_path / "out")
+
+
+def test_runtime_python_requires_an_executable_absolute_interpreter(tmp_path):
+    runtime_python = tmp_path / "runtime" / "bin" / "python"
+    runtime_python.parent.mkdir(parents=True)
+    runtime_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    runtime_python.chmod(0o755)
+
+    assert runner._runtime_python({"runtime": {"python": str(runtime_python)}}) == str(runtime_python.resolve())
+    with pytest.raises(ValueError, match="executable absolute path"):
+        runner._runtime_python({"runtime": {"python": "relative/python"}})
+
+
+def test_runtime_pythonpath_requires_an_absolute_source_directory(tmp_path):
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    assert runner._runtime_pythonpath({"runtime": {"pythonpath": str(source_root)}}) == str(source_root.resolve())
+    with pytest.raises(ValueError, match="absolute directory"):
+        runner._runtime_pythonpath({"runtime": {"pythonpath": "relative/source"}})
+
+
+def test_extra_args_accept_vllm_numa_binding_capability(monkeypatch):
+    monkeypatch.setenv(
+        "HYPERLOOM_HARDWARE_FINGERPRINT",
+        json.dumps({"vllm_cli": {"server_flags": ["--numa-bind", "--numa-bind-nodes"]}}),
+    )
+    assert runner._tokenize_extra_args({"EXTRA_VLLM_ARGS": "--numa-bind --numa-bind-nodes 0 1"}) == [
+        "--numa-bind",
+        "--numa-bind-nodes",
+        "0",
+        "1",
+    ]

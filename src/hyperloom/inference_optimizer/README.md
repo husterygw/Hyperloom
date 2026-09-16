@@ -59,17 +59,39 @@ See `python -m hyperloom.inference_optimizer.cli optimize --help` for the full f
 [SKILL.md](SKILL.md) for the prompt-driven launch workflow used inside
 Cursor and Claw.
 
-## Experimental NVIDIA/vLLM target
+## NVIDIA/CUDA platform
 
-The `nvidia_rtx4090_8x_local` target defaults to config optimization for the
-validated local host: exactly eight RTX 4090 GPUs (compute capability 8.9) and
-CUDA 13.0 at `/usr/local/cuda-13.0`. vLLM is operator-managed rather than
-version-pinned: preflight probes the selected interpreter's `vllm serve` and
-`vllm bench serve` CLI, then fails closed only when it lacks the runner's
-required capabilities. The actual version and CLI surface are recorded in the
-session hardware fingerprint. It also fails closed on hardware, compiler,
-session-resume, or `TP*PP` drift. It does not enter
-the ROCm/Magpie/InferenceX/TraceLens/GEAK/Quark paths.
+Use `--target nvidia_cuda` for NVIDIA GPUs. The legacy
+`nvidia_rtx4090_8x_local` name remains an alias. GPU model, memory, compute
+capability and device count are discovered at runtime; there is no board or
+CUDA-version whitelist. The GPU platform is independent of the inference
+framework. Execution backends own framework-specific checks; the currently
+connected CUDA benchmark backend is `vllm_cuda`.
+
+`CUDA_VISIBLE_DEVICES` accepts CUDA ordinals or GPU UUIDs, including a reordered
+subset. CUDA enumeration is matched to NVML by UUID; CUDA ordinals are not
+assumed to equal NVML indices. An explicitly empty mask or `-1` exposes no
+usable devices. `--gpus-per-node N` caps the visible pool to its first N devices
+and cannot exceed it. Each task allocates its required devices from that pool;
+children receive UUIDs, while reports retain physical and logical mappings.
+
+The driver and runtime are checked independently of the development toolkit.
+Toolkit discovery uses explicit `CUDA_HOME`, `nvcc` on PATH, then
+`/usr/local/cuda`. Ordinary serving does not require nvcc. The backend checks
+its actual Python/PyTorch/framework environment and required CLI capabilities;
+profilers are checked only when requested. Missing execution combinations are
+reported explicitly, without falling back to an AMD runner.
+
+Sessions save the platform, backend, ordered device pool and software identity.
+Resume revalidates those identities. Legacy sessions can migrate only when
+saved identities match; missing evidence or changed devices/software require
+a new session. Supported execution remains Linux, single-node, whole GPUs;
+MIG and cross-architecture parallel groups are rejected.
+
+Validation coverage and hardware limits are recorded in
+[the platform generalization report](../../../docs/nvidia-platform-generalization-validation.md).
+
+The example below uses the existing vLLM backend on one visible GPU:
 
 ```bash
 conda activate llm_sim
@@ -78,11 +100,11 @@ export HYPERLOOM_BENCHMARK_BACKEND=vllm_cuda
 bash src/hyperloom/inference_optimizer/assets/install.sh
 
 python -m hyperloom.inference_optimizer.cli optimize \
-    --target nvidia_rtx4090_8x_local \
+    --target nvidia_cuda \
     --codex-cli-auth \
     --model /path/to/model \
     --framework vllm \
-    --tp 1 --pp 8 \
+    --tp 1 --pp 1 \
     --isl 128 --osl 32 --conc 2 \
     --num-prompts 100 --num-warmups 5 \
     --max-hours 2
@@ -142,7 +164,9 @@ and cannot update the baseline or a performance winner.
 `profile`, `roofline` and `trace_analysis` are independent capabilities.
 `--optimization-level profile --profile-backend nsys` selects the native NVIDIA
 timeline analyzer and ncu hotspot roofline. `--no-enable-roofline` skips ncu
-while retaining the nsys analysis. Tool paths and versions are checked before
+while retaining the nsys analysis. Counter selection queries the sampled devices
+and installed ncu; unsupported counters remain unavailable without discarding
+a valid timeline. Tool paths and versions are checked before
 launch and persisted; resume requires matching backend, roofline setting and
 tools. Old sessions retain their saved capabilities.
 

@@ -17,8 +17,8 @@ from hyperloom.inference_optimizer.target_registry import (
     TargetValidationError,
     get_target,
     validate_target_arguments,
-    validate_profile_runtime,
 )
+from hyperloom.orchestrator.actions.executors.vllm_cuda_preflight import validate_profile_runtime
 from hyperloom.inference_optimizer.protocol.action_surfaces import target_capability_enabled
 from hyperloom.orchestrator.actions.executors.cuda_profile import CudaProfileExecutor, validate_cuda_traces
 from hyperloom.orchestrator.actions.executors import vllm_cuda_runner as runner
@@ -122,6 +122,38 @@ def test_materialization_preserves_launch_args_and_bounds_capture(tmp_path):
     assert updated["benchmark"]["envs"]["NUM_PROMPTS"] == 16
     assert updated["benchmark"]["profiler"]["torch_profiler"]["enabled"]
     assert not updated["benchmark"]["server_lifecycle"]["enabled"]
+
+
+@pytest.mark.parametrize(
+    "visible,pp,selected,expected", [("6", 1, None, [0]), ("7,6", 2, None, [0, 1]), ("7,6", 2, [1], [1])]
+)
+def test_ncu_launch_is_explicitly_scoped_to_leased_logical_devices(
+    tmp_path, monkeypatch, visible, pp, selected, expected
+):
+    from hyperloom.orchestrator.actions.executors import cuda_nsight
+
+    _cuda_env(monkeypatch, tmp_path, visible=visible)
+    monkeypatch.setattr(cuda_nsight, "tool_fingerprint", lambda **kw: {"ncu": {"path": "/ncu", "version": "test"}})
+    monkeypatch.setattr(
+        cuda_nsight, "query_roofline_metrics", lambda *a, **kw: {"selected": ["gpu__time_duration.sum"]}
+    )
+    launched = []
+
+    def launch(argv, **kwargs):
+        launched.append((argv, kwargs["env"]["CUDA_VISIBLE_DEVICES"]))
+        raise RuntimeError("intentional launch failure before GPU initialization")
+
+    monkeypatch.setattr(runner.subprocess, "Popen", launch)
+    path = _config(tmp_path, pp=pp)
+    CudaProfileExecutor(backend="ncu", kernel_name="compute", devices=selected)._after_materialize_config(
+        path, tmp_path
+    )
+    assert runner.run_benchmark(path, tmp_path / "out") == 1
+    argv, serving_devices = launched[0]
+    assert serving_devices == ",".join(f"GPU-{int(i):02d}" for i in visible.split(","))
+    assert argv[argv.index("--devices") + 1] == ",".join(map(str, expected))
+    policy = json.loads(next((tmp_path / "out").rglob("ncu_capture_policy.json")).read_text())
+    assert policy["devices"] == expected
 
 
 @pytest.mark.parametrize("failure", [None, "missing_rank", "start_failed", "stop_in_progress", "client_failed"])
@@ -290,8 +322,10 @@ async def test_nv_resume_restores_budget_unless_explicit(tmp_path, monkeypatch, 
 
     SharedState(target_id=NVIDIA_LOCAL_TARGET, max_minutes=30).save(tmp_path)
     monkeypatch.delenv("HYPERLOOM_TARGET", raising=False)
-    def end_preflight(*args):
+
+    def end_preflight(*args, **kwargs):
         raise TargetValidationError("test ends at hardware preflight")
+
     monkeypatch.setattr(target_registry, "validate_nvidia_host", end_preflight)
     args = _build_parser().parse_args(["optimize", "--resume-from", str(tmp_path), *extra])
     with pytest.raises(SystemExit):

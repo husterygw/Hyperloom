@@ -262,6 +262,8 @@ def _seed_shared_state(
         framework=os.environ.get("FRAMEWORK", "sglang"),
         gpu_type=str(getattr(args, "gpu_type", None) or os.environ.get("GPU_TYPE", "")),
         target_id=str(getattr(args, "target", None) or os.environ.get("HYPERLOOM_TARGET", "amd_auto")),
+        target_runtime=os.environ.get("HYPERLOOM_TARGET_RUNTIME", "rocm"),
+        device_pool=list((getattr(args, "hardware_fingerprint", {}) or {}).get("devices", [])),
         optimization_level=str(getattr(args, "optimization_level", None) or "config"),
         profile_backend=str(getattr(args, "profile_backend", None) or "torch"),
         profile_tool_fingerprint=dict(getattr(args, "profile_tool_fingerprint", {}) or {}),
@@ -279,16 +281,8 @@ def _seed_shared_state(
         conc=_int_arg("conc", DEFAULT_CONC),
         isl=_int_arg("isl", DEFAULT_ISL),
         osl=_int_arg("osl", DEFAULT_OSL),
-        num_prompts=(
-            int(getattr(args, "num_prompts"))
-            if getattr(args, "num_prompts", None) is not None
-            else None
-        ),
-        num_warmups=(
-            int(getattr(args, "num_warmups"))
-            if getattr(args, "num_warmups", None) is not None
-            else None
-        ),
+        num_prompts=(int(getattr(args, "num_prompts")) if getattr(args, "num_prompts", None) is not None else None),
+        num_warmups=(int(getattr(args, "num_warmups")) if getattr(args, "num_warmups", None) is not None else None),
         quality_suite=str(getattr(args, "quality_suite", "smoke") or "smoke"),
         profile_osl=_int_arg("profile_osl", 0),
         max_model_len=_int_arg("max_model_len", 0),
@@ -328,8 +322,10 @@ def _seed_shared_state(
         ),
         # Standalone FRAMEWORK_AGENT phase; --no-framework-agent skips it.
         framework_agent_phase_enabled=not bool(getattr(args, "no_framework_agent", False)),
-        framework_agent_phase_done=(str(getattr(args, "target", "") or "") == "nvidia_rtx4090_8x_local"),
-        framework_agent_authoring_enabled=(str(getattr(args, "target", "") or "") != "nvidia_rtx4090_8x_local"),
+        framework_agent_phase_done=(not dict(getattr(args, "target_capabilities", {}) or {}).get("source_patch", True)),
+        framework_agent_authoring_enabled=dict(getattr(args, "target_capabilities", {}) or {}).get(
+            "source_patch", True
+        ),
         # FRAMEWORK local-exploration arm; --no-framework-local-explore opts out.
         framework_local_explore_enabled=not bool(getattr(args, "no_framework_local_explore", False)),
         # Enablement self-heal lanes; --enablement off opts out.

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""Execution-target contracts for the local 8x RTX 4090 CUDA MVP."""
+"""Platform targets, backend boundaries and NVIDIA capability policy."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from hyperloom.inference_optimizer.target_registry import (
     DEFAULT_TARGET,
     HARDWARE_FINGERPRINT_ENV,
     NVIDIA_LOCAL_TARGET,
+    NVIDIA_CUDA_TARGET,
     NvidiaDevice,
     TargetValidationError,
     build_hardware_fingerprint,
@@ -24,7 +25,6 @@ from hyperloom.inference_optimizer.target_registry import (
     get_target,
     resolve_target,
     target_names,
-    validate_nvidia_host,
     validate_target_arguments,
 )
 from hyperloom.inference_optimizer.protocol.intent import Intent, IntentType
@@ -77,12 +77,13 @@ def _args(**overrides):
 
 def test_registry_keeps_amd_default_and_explicit_nvidia_target(monkeypatch):
     monkeypatch.delenv("HYPERLOOM_TARGET", raising=False)
-    assert target_names() == (DEFAULT_TARGET, NVIDIA_LOCAL_TARGET)
+    assert target_names() == (DEFAULT_TARGET, NVIDIA_CUDA_TARGET, NVIDIA_LOCAL_TARGET)
     assert resolve_target().target_id == DEFAULT_TARGET
     target = get_target(NVIDIA_LOCAL_TARGET)
     assert target.runtime == "cuda"
-    assert target.benchmark_backend == "vllm_cuda"
-    assert target.expected_gpu_count == 8
+    assert target.target_id == NVIDIA_CUDA_TARGET
+    assert not hasattr(target, "expected_gpu_count")
+    assert not hasattr(target, "benchmark_backend")
     assert target.capabilities.config_explore is True
     assert target.capabilities.profile is False
     assert target.capabilities.source_patch is False
@@ -122,21 +123,20 @@ def test_cli_parses_target_and_pipeline_parallelism():
 def test_cuda_target_arguments_are_forced_to_config_only():
     args = _args()
     validate_target_arguments(args, get_target(NVIDIA_LOCAL_TARGET))
-    assert args.framework == "vllm"
+    assert args.framework is None
     assert args.no_kernel is True
     assert args.enable_roofline is False
     assert args.no_framework_agent is False
     assert args.no_framework_local_explore is True
     assert args.enablement == "off"
     assert args.no_warm_replay is True
-    assert args.no_eval is True
+    assert args.no_eval is False
 
 
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
         ({"nodes": 2}, "single-node"),
-        ({"framework": "sglang"}, "requires --framework vllm"),
         ({"gpu_type": "mi300x"}, "AMD-only"),
         ({"quantize": "fp8"}, "does not support quantization"),
     ],
@@ -153,11 +153,8 @@ def test_configure_cuda_environment_is_vendor_clean(monkeypatch):
     fingerprint = {"target_id": NVIDIA_LOCAL_TARGET, "cuda_home": "/cuda", "sha256": "abc"}
     configure_target_environment(get_target(NVIDIA_LOCAL_TARGET), fingerprint=fingerprint)
     assert os.environ["HYPERLOOM_TARGET_RUNTIME"] == "cuda"
-    assert os.environ["HYPERLOOM_BENCHMARK_BACKEND"] == "vllm_cuda"
-    assert os.environ["INFERENCE_OPTIMIZER_RAY_EXEC"] == "0"
     assert os.environ["CUDA_HOME"] == "/cuda"
     assert os.environ["PATH"].split(":")[0] == "/cuda/bin"
-    assert os.environ["VLLM_PLUGINS"] == ""
     assert "ROCR_VISIBLE_DEVICES" not in os.environ
     assert "HIP_VISIBLE_DEVICES" not in os.environ
     assert json.loads(os.environ[HARDWARE_FINGERPRINT_ENV])["sha256"] == "abc"
@@ -188,55 +185,9 @@ def test_hardware_fingerprint_is_deterministic(monkeypatch):
     assert first["devices"][4]["numa_node"] == 1
 
 
-def test_nvidia_host_validation_records_capability_validated_stack(monkeypatch):
-    import torch
-    from hyperloom.inference_optimizer import target_registry as registry
-
-    monkeypatch.setattr(registry, "discover_nvidia_devices", lambda: tuple(_device(i) for i in range(8)))
-    monkeypatch.setattr(registry, "_nvcc_release", lambda path: "Cuda compilation tools, release 13.0")
-    monkeypatch.setattr(registry, "_nvidia_driver_version", lambda: "590.48.01")
-    monkeypatch.setattr(registry.importlib.metadata, "version", lambda name: "0.28.0" if name == "vllm" else "")
-    monkeypatch.setattr(
-        registry,
-        "_probe_vllm_cli_flags",
-        lambda *subcommand: set(
-            registry.VLLM_CUDA_REQUIRED_SERVER_FLAGS
-            if subcommand == ("serve",)
-            else registry.VLLM_CUDA_REQUIRED_BENCH_FLAGS
-        ),
-    )
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
-    monkeypatch.delenv("CUDA_HOME", raising=False)
-    fingerprint = validate_nvidia_host(get_target(NVIDIA_LOCAL_TARGET))
-    assert fingerprint["target_id"] == NVIDIA_LOCAL_TARGET
-    assert fingerprint["cuda_home"] == "/usr/local/cuda-13.0"
-    assert fingerprint["vllm_version"] == "0.28.0"
-    assert fingerprint["vllm_cli"]["server_flags"] == sorted(registry.VLLM_CUDA_REQUIRED_SERVER_FLAGS)
-    assert fingerprint["vllm_cli"]["bench_flags"] == sorted(registry.VLLM_CUDA_REQUIRED_BENCH_FLAGS)
-    assert fingerprint["driver_version"] == "590.48.01"
-    assert fingerprint["torch_cuda_version"]
-    assert fingerprint["nccl_version"]
-
-
-def test_nvidia_host_validation_rejects_missing_required_vllm_cli_capability(monkeypatch):
-    import torch
-    from hyperloom.inference_optimizer import target_registry as registry
-
-    monkeypatch.setattr(registry, "discover_nvidia_devices", lambda: tuple(_device(i) for i in range(8)))
-    monkeypatch.setattr(registry, "_nvcc_release", lambda path: "Cuda compilation tools, release 13.0")
-    monkeypatch.setattr(registry.importlib.metadata, "version", lambda name: "99.0.0" if name == "vllm" else "")
-    monkeypatch.setattr(registry, "_probe_vllm_cli_flags", lambda *subcommand: {"--host"})
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
-
-    with pytest.raises(TargetValidationError, match="missing required flag"):
-        validate_nvidia_host(get_target(NVIDIA_LOCAL_TARGET))
-
-
 def test_v6_state_migrates_target_and_pp_defaults():
     state = SharedState.from_dict({"schema_version": 6, "session_id": "old", "tp": 4})
-    assert state.schema_version == LATEST_STATE_SCHEMA_VERSION == 9
+    assert state.schema_version == LATEST_STATE_SCHEMA_VERSION == 10
     assert state.target_id == DEFAULT_TARGET
     assert state.target_capabilities == {}
     assert state.hardware_fingerprint == {}
@@ -249,7 +200,10 @@ def test_v6_state_migrates_target_and_pp_defaults():
 def test_prompt_and_policy_filter_disabled_target_actions():
     capabilities = get_target(NVIDIA_LOCAL_TARGET).capabilities.to_dict()
     actions = default_enabled_actions(no_kernel=False, target_capabilities=capabilities)
-    assert {"baseline", "explore", "sweep", "report"} <= set(actions)
+    # ``sweep`` was retired from the LLM-facing prompt surface upstream;
+    # concurrency sweeps are Coordinator-managed via ``conc_sweep``.
+    assert {"baseline", "explore", "report"} <= set(actions)
+    assert "sweep" not in actions
     assert {"roofline", "integrate_patch", "kernel_opt", "integrate", "gemm_tuning"}.isdisjoint(actions)
 
     state = SharedState(
@@ -311,7 +265,7 @@ def test_config_only_nvidia_target_skips_kernel_agent_env(monkeypatch, tmp_path)
 
     assert result["status"] == "skipped"
     assert result["skip_reason"] == "target_capability_disabled"
-    assert result["detail"]["target_id"] == NVIDIA_LOCAL_TARGET
+    assert result["detail"]["target_id"] == NVIDIA_CUDA_TARGET
 
 
 def test_cuda_serving_framework_gate_accepts_cuda_vllm(monkeypatch):

@@ -12,6 +12,8 @@ Dispatch table is exposed via :data:`KERNEL_REQUEST_HANDLERS` for test monkey-pa
 
 from __future__ import annotations
 
+from hyperloom.inference_optimizer.target_registry import is_cuda_target
+
 import asyncio
 import functools
 import importlib
@@ -5334,7 +5336,7 @@ async def trace_analyze_handler(
     from ..state.shared_state import SharedState
 
     cuda_state = SharedState.load_or_init(session_dir)
-    if cuda_state.target_id == "nvidia_rtx4090_8x_local":
+    if is_cuda_target(cuda_state.target_id):
         if cuda_state.profile_backend != "nsys" or not cuda_state.target_capabilities.get("trace_analysis"):
             return {"status": "failed", "error": "NVIDIA trace analysis requires the nsys backend"}
         trace = Path(trace_input).resolve()

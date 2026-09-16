@@ -62,13 +62,19 @@ class CudaProfileExecutor(BaselineExecutor):
         *args: Any,
         backend: str | None = None,
         kernel_name: str = "",
+        kernel_names: list[str] | None = None,
+        devices: list[int] | None = None,
+        worker_rank: int | None = None,
         delay_iterations: int = 0,
-        max_iterations: int = 4,
+        max_iterations: int = 0,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.backend = backend or getattr(self.shared_state, "profile_backend", "torch")
         self.kernel_name = kernel_name
+        self.kernel_names = list(kernel_names) if kernel_names is not None else [kernel_name]
+        self.devices = devices
+        self.worker_rank = worker_rank
         self.delay_iterations = delay_iterations
         self.max_iterations = max_iterations
         self._capture_output_dir: Path | None = None
@@ -84,6 +90,9 @@ class CudaProfileExecutor(BaselineExecutor):
                 "cuda_profiler": {
                     "backend": self.backend,
                     "kernel_name": self.kernel_name,
+                    "kernel_names": self.kernel_names,
+                    "devices": self.devices,
+                    "worker_rank": self.worker_rank,
                     "delay_iterations": self.delay_iterations,
                     "max_iterations": self.max_iterations,
                     "tools": dict(getattr(self.shared_state, "profile_tool_fingerprint", {}) or {}),
@@ -127,6 +136,9 @@ class CudaProfileExecutor(BaselineExecutor):
                     port = pidfile.stem.removeprefix("vllm_")
                     if port.isdigit():
                         teardown_lifecycle_server(pid_dir=pidfile.parent, framework="vllm", port=int(port))
+                from .cuda_profiler_launch import cleanup_profile_workers
+
+                cleanup_profile_workers(self._capture_output_dir)
         result["measurement_kind"] = "profile"
         result["valid_measurement"] = False
         result["backend"] = self.backend
@@ -143,6 +155,8 @@ class CudaProfileExecutor(BaselineExecutor):
         profile = json.loads(artifact.read_text(encoding="utf-8"))
         result.update({key: profile[key] for key in ("trace_files", "trace_health", "fingerprints")})
         result["profile_artifact"] = str(artifact)
+        result["capture_failure"] = profile.get("capture_failure")
+        result["topology"] = profile.get("topology", {})
         result["analysis_result"] = profile.get("analysis_result", {})
         result["main_trace_path"] = next(iter(profile["trace_files"]), None)
         if profile["status"] != "succeeded":

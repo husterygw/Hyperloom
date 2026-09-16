@@ -37,7 +37,11 @@ class CudaRooflineExecutor:
         errors = []
 
         async def capture(
-            backend: str, directory: str, kernel_name: str = "", delay_iterations: int = 0, max_iterations: int = 4
+            backend: str,
+            directory: str,
+            names: list[str] | None = None,
+            devices: list[int] | None = None,
+            worker_rank: int | None = None,
         ) -> dict[str, Any]:
             child = copy.copy(ctx)
             child.task = copy.copy(ctx.task)
@@ -48,9 +52,11 @@ class CudaRooflineExecutor:
                 session_dir=session_dir,
                 shared_state=self.shared_state,
                 backend=backend,
-                kernel_name=kernel_name,
-                delay_iterations=delay_iterations,
-                max_iterations=max_iterations,
+                kernel_names=names,
+                devices=devices,
+                worker_rank=worker_rank,
+                delay_iterations=0,
+                max_iterations=0,
             )(child)
 
         try:
@@ -61,26 +67,45 @@ class CudaRooflineExecutor:
                 workspace = Path(result["workspace"])
                 summary = json.loads((workspace / "nsight_summary.json").read_text())
                 selected = [r for r in summary["hot_kernels"] if not r["communication"]][:3]
+                rank_uuids = {r["rank"]: r["gpu_uuid"] for r in summary["ranks"]}
                 if not selected:
                     errors.append("no non-communication hotspot available")
-                for index, hotspot in enumerate(selected):
-                    # Align to the latest rank's first occurrence; collecting
-                    # an earlier partial pipeline wave can stall its peers.
-                    # Empty execution steps count toward this window too.
-                    steps = list(hotspot.get("first_step_by_rank", {}).values())
-                    delay = max(0, max(steps) - 1) if steps else 0
-                    spread = max(steps) - min(steps) if steps else 0
-                    # Staggered ranks need another pipeline wave to sample
-                    # the same name after the common starting point.
-                    pp = max(1, int(getattr(self.shared_state, "pp", 1) or 1))
-                    iterations = spread + max(4, 2 * pp) if spread else 4
-                    counter = await capture("ncu", f"counter_{index}", hotspot["name"], delay, iterations)
+                # Nsight instrumentation of unselected TP workers can also
+                # stall prefill. Profile one worker at a time for all phases.
+                # Bound each selected name to one launch in the same run,
+                # avoiding a complete service restart for every hotspot.
+                jobs = []
+                isolate = int(getattr(self.shared_state, "tp", 1) or 1) > 1
+                if isolate:
+                    for device, uuid in enumerate(result["topology"]["gpu_uuids"]):
+                        rank = next(r["rank"] for r in summary["ranks"] if r["gpu_uuid"] == uuid)
+                        targets = [h for h in selected if rank in h["ranks"]]
+                        if targets:
+                            jobs.append((f"counter_device_{device}", targets, [device], {rank}))
+                else:
+                    for index, hotspot in enumerate(selected):
+                        jobs.append((f"counter_{index}", [hotspot], None, set(hotspot["ranks"])))
+                summary["counter_strategy"] = "isolated_workers" if isolate else "sequential_hotspots"
+                for directory, targets, devices, expected_ranks in jobs:
+                    counter = await capture(
+                        "ncu",
+                        directory,
+                        [h["name"] for h in targets],
+                        devices,
+                        next(iter(expected_ranks)) if devices else None,
+                    )
                     health = counter.get("trace_health") or {}
                     ranks = {r["rank"] for r in health.get("ranks", [])}
-                    if counter.get("status") != "succeeded" or ranks != set(hotspot["ranks"]):
+                    if counter.get("status") != "succeeded":
                         errors.append(
-                            f"{hotspot['kernel_id']}: counter capture failed or rank coverage mismatch: "
+                            f"{directory}: counter capture failed ({counter.get('capture_failure')}): "
                             f"{counter.get('error', '')}"
+                        )
+                        continue
+                    if ranks != expected_ranks:
+                        errors.append(
+                            f"{directory}: rank coverage mismatch: "
+                            f"expected {sorted(expected_ranks)}, collected {sorted(ranks)}"
                         )
                         continue
                     identity_keys = ("hardware", "model", "workload", "serving_config", "quality_suite")
@@ -90,34 +115,51 @@ class CudaRooflineExecutor:
                         not expected_identity.get(k) or counter_identity.get(k) != expected_identity[k]
                         for k in identity_keys
                     ):
-                        errors.append(
-                            f"{hotspot['kernel_id']}: model/workload/serving configuration fingerprint mismatch"
+                        errors.append(f"{directory}: model/workload/serving configuration fingerprint mismatch")
+                        continue
+                    for hotspot in targets:
+                        expected = {(r["rank"], tuple(r["grid"]), tuple(r["block"])) for r in hotspot["launches"]}
+                        matched = []
+                        for launch in health.get("launches", []):
+                            if launch["kernel_name"] != hotspot["name"]:
+                                continue
+
+                            def dims(text: str) -> tuple[int, ...]:
+                                return tuple(int(x.strip()) for x in text.strip("()").split(","))
+
+                            signature = (launch["rank"], dims(launch["grid"]), dims(launch["block"]))
+                            if (
+                                signature in expected
+                                and launch["rank"] in expected_ranks
+                                and launch.get("gpu_uuid") == rank_uuids[launch["rank"]]
+                            ):
+                                matched.append(
+                                    {
+                                        **{k: v for k, v in launch.items() if k != "metrics"},
+                                        "profile_artifact": counter["profile_artifact"],
+                                    }
+                                )
+                        if {r["rank"] for r in matched} != expected_ranks:
+                            errors.append(f"{directory}/{hotspot['kernel_id']}: launch-shape attribution incomplete")
+                            continue
+                        evidence = hotspot.setdefault(
+                            "ncu_roofline",
+                            {
+                                "launches": [],
+                                "profile_artifact": counter["profile_artifact"],
+                                "profile_artifacts": [],
+                                "trace_files": [],
+                            },
                         )
-                        continue
-                    # Validate actual launch shapes against the timeline before
-                    # relating counter points across independently booted runs.
-                    expected = {(r["rank"], tuple(r["grid"]), tuple(r["block"])) for r in hotspot["launches"]}
-                    matched = []
-                    for launch in health.get("launches", []):
-
-                        def dims(text: str) -> tuple[int, ...]:
-                            return tuple(int(x.strip()) for x in text.strip("()").split(","))
-
-                        signature = (launch["rank"], dims(launch["grid"]), dims(launch["block"]))
-                        if signature in expected:
-                            # Raw metric tables remain in the counter artifact;
-                            # do not duplicate thousands of columns in state/prompts.
-                            matched.append({k: v for k, v in launch.items() if k != "metrics"})
-                    if {r["rank"] for r in matched} != ranks:
-                        errors.append(f"{hotspot['kernel_id']}: launch-shape attribution incomplete")
-                        continue
-                    hotspot["ncu_roofline"] = {
-                        "launches": matched,
-                        "profile_artifact": counter["profile_artifact"],
-                        "trace_files": counter["trace_files"],
-                    }
-                    if {r["rank"] for r in matched if r["ncu_roofline"]["status"] == "available"} != ranks:
-                        errors.append(f"{hotspot['kernel_id']}: roofline arithmetic metrics unavailable")
+                        evidence["launches"].extend(matched)
+                        evidence["profile_artifacts"].append(counter["profile_artifact"])
+                        evidence["trace_files"].extend(counter["trace_files"])
+                for hotspot in selected:
+                    launches = (hotspot.get("ncu_roofline") or {}).get("launches", [])
+                    if {r["rank"] for r in launches if r["ncu_roofline"]["status"] == "available"} != set(
+                        hotspot["ranks"]
+                    ):
+                        errors.append(f"{hotspot['kernel_id']}: complete rank coverage or roofline metrics unavailable")
         except asyncio.CancelledError:
             if result is not None and summary is not None:
                 summary["counter_status"] = "cancelled"

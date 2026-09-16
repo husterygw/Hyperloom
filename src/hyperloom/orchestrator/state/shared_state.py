@@ -345,7 +345,7 @@ _KEY_METRIC_MAP: dict[str, tuple[str, str]] = {
 
 
 #: top-level state.json schema version; absent key treated as v1 and migrated to LATEST_STATE_SCHEMA_VERSION on first save.
-LATEST_STATE_SCHEMA_VERSION: int = 9
+LATEST_STATE_SCHEMA_VERSION: int = 10
 
 
 def effective_closing_grace_sec(
@@ -448,6 +448,8 @@ class SharedState(_RenderMixin, _ExploreStateMixin):
     # Execution target is independent of the AMD board identity above. Sessions
     # predating v7 migrate to amd_auto.
     target_id: str = "amd_auto"
+    target_runtime: str = "rocm"
+    device_pool: list[dict[str, Any]] = field(default_factory=list)
     target_capabilities: dict[str, bool] = field(default_factory=dict)
     optimization_level: str = "config"
     profile_backend: str = "torch"
@@ -1180,6 +1182,9 @@ class SharedState(_RenderMixin, _ExploreStateMixin):
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "SharedState":
         """Construct a :class:`SharedState` from a raw mapping."""
+        # State files written before the current schema omit this field; treat
+        # them as version 1 so the version-gated defaults below can run.
+        incoming_version = int(raw.get("schema_version") or 1)
         # Filter to known fields; unknown keys dropped, missing keys default.
         known = {f.name for f in fields(cls)}
         filtered = {k: v for k, v in raw.items() if k in known}
@@ -1228,6 +1233,22 @@ class SharedState(_RenderMixin, _ExploreStateMixin):
 
         if incoming_version < 9:
             filtered.setdefault("quality_suite", "smoke")
+
+        if incoming_version < 10:
+            from hyperloom.inference_optimizer.target_registry import get_target
+
+            target = get_target(str(filtered.get("target_id") or "amd_auto"))
+            filtered["target_id"] = target.target_id
+            filtered["target_runtime"] = target.runtime
+            # Historical fingerprints have no proven visible-device mapping.
+            # Revalidation at resume is required before publishing a device pool.
+            filtered.setdefault("device_pool", [])
+
+        if filtered.get("target_id") == "nvidia_rtx4090_8x_local":
+            from hyperloom.inference_optimizer.target_registry import NVIDIA_CUDA_TARGET
+
+            filtered["target_id"] = NVIDIA_CUDA_TARGET
+            filtered["target_runtime"] = "cuda"
 
         if isinstance(filtered.get("enablement"), dict):
             filtered["enablement"] = EnablementRound.from_dict(filtered["enablement"])

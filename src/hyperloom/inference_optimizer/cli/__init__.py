@@ -115,7 +115,10 @@ from ..session.paths import (
 
 log = logging.getLogger("hyperloom.inference_optimizer.cli")
 
-from hyperloom.common.workload_defaults import (
+from .parser import (
+    _build_parser as _build_parser,
+    _positive_int_arg as _positive_int_arg,
+    _redact_unknown_args as _redact_unknown_args,
     DEFAULT_ISL,
     DEFAULT_OSL,
     DEFAULT_CONC,
@@ -123,11 +126,6 @@ from hyperloom.common.workload_defaults import (
     DEFAULT_PP,
     DEFAULT_EP,
     DEFAULT_PRECISION,
-)
-from .parser import (
-    _build_parser as _build_parser,
-    _positive_int_arg as _positive_int_arg,
-    _redact_unknown_args as _redact_unknown_args,
 )
 from .preflight import (
     _check_gfx_arch_resolvable,
@@ -1225,9 +1223,7 @@ def _export_workload_envs_for_optimize(
             os.environ.pop(env_name, None)
         else:
             os.environ[env_name] = str(int(value))
-    os.environ["INFERENCE_OPTIMIZER_QUALITY_SUITE"] = str(
-        getattr(args, "quality_suite", "smoke") or "smoke"
-    )
+    os.environ["INFERENCE_OPTIMIZER_QUALITY_SUITE"] = str(getattr(args, "quality_suite", "smoke") or "smoke")
 
 
 def _export_operator_launch_shape(
@@ -1541,7 +1537,14 @@ async def _run_optimize(args: argparse.Namespace) -> int:
         resolve_target,
         validate_nvidia_host,
         validate_target_arguments,
+        validate_resume_environment,
+    )
+
+    from hyperloom.orchestrator.actions.executors.benchmark_backend import select_platform_backend
+    from hyperloom.orchestrator.actions.executors.vllm_cuda_preflight import (
+        validate_execution_stack,
         validate_profile_runtime,
+        validate_execution_identity,
     )
 
     persisted_target = ""
@@ -1555,7 +1558,11 @@ async def _run_optimize(args: argparse.Namespace) -> int:
         except Exception:  # noqa: BLE001 - canonical resume validation reports malformed state later
             pass
     explicit_target = str(getattr(args, "target", None) or os.environ.get("HYPERLOOM_TARGET", "")).strip()
-    if persisted_target and explicit_target and explicit_target != persisted_target:
+    if (
+        persisted_target
+        and explicit_target
+        and resolve_target(explicit_target).target_id != resolve_target(persisted_target).target_id
+    ):
         print(
             f"ERROR: resume target conflict: session={persisted_target!r}, requested={explicit_target!r}. "
             "Start a new session for a different target.",
@@ -1582,7 +1589,29 @@ async def _run_optimize(args: argparse.Namespace) -> int:
                 raise TargetValidationError("resume enable_roofline conflict; start a new session")
             args.enable_roofline = _early_state.enable_roofline
         validate_target_arguments(args, target)
-        hardware_fingerprint = validate_nvidia_host(target) if target.runtime == "cuda" else {}
+        hardware_fingerprint = {}
+        if target.runtime == "cuda":
+            # Framework requirements belong to the backend, not to the platform registry.
+            framework = str(getattr(args, "framework", "") or getattr(_early_state, "framework", "") or "")
+            requested_backend = os.environ.get("HYPERLOOM_BENCHMARK_BACKEND", "").strip().lower()
+            if _early_state is not None:
+                saved_backend = getattr(_early_state, "benchmark_backend", "")
+                if requested_backend and saved_backend and requested_backend != saved_backend:
+                    raise TargetValidationError("Resume execution backend changed; start a new session")
+                requested_backend = requested_backend or saved_backend
+            args.benchmark_backend = select_platform_backend(target.runtime, framework, requested_backend)
+            args.framework = framework or "vllm"  # Default supplied by the selected vllm_cuda backend.
+            args.no_eval = True  # This backend does not yet implement the common lm-eval path.
+            capacity = getattr(args, "gpus_per_node", None)
+            if capacity is None and _early_state is not None:
+                saved_pool = getattr(_early_state, "device_pool", [])
+                capacity = len(saved_pool) or None
+            hardware_fingerprint = validate_nvidia_host(target, capacity=capacity)
+            args.gpus_per_node = len(hardware_fingerprint["devices"])
+            hardware_fingerprint = validate_execution_stack(hardware_fingerprint)
+            os.environ["HYPERLOOM_BENCHMARK_BACKEND"] = args.benchmark_backend
+            os.environ["INFERENCE_OPTIMIZER_RAY_EXEC"] = "0"
+            os.environ["VLLM_PLUGINS"] = ""
         if target.runtime == "cuda" and args.optimization_level == "profile":
             args.profile_tool_fingerprint = validate_profile_runtime(
                 hardware_fingerprint, backend=args.profile_backend, roofline=args.enable_roofline
@@ -1591,17 +1620,19 @@ async def _run_optimize(args: argparse.Namespace) -> int:
             if saved_tools and saved_tools != args.profile_tool_fingerprint:
                 raise TargetValidationError("Nsight tool fingerprint changed; start a new session")
         if persisted_hardware and hardware_fingerprint:
-            if persisted_hardware.get("sha256") != hardware_fingerprint.get("sha256"):
-                raise TargetValidationError(
-                    "NVIDIA hardware fingerprint changed since session creation; start a new session"
-                )
+            validate_resume_environment(persisted_hardware, hardware_fingerprint)
+            validate_execution_identity(persisted_hardware, hardware_fingerprint)
+        if _early_state is not None and target.runtime == "cuda" and not persisted_hardware:
+            raise TargetValidationError("Saved NVIDIA session lacks environment identity; start a new session")
         configure_target_environment(target, fingerprint=hardware_fingerprint)
     except TargetValidationError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
     args.target = target.target_id
     args.hardware_fingerprint = hardware_fingerprint
-    print(f"Execution target : {target.target_id} ({target.runtime}, backend={target.benchmark_backend})")
+    print(
+        f"Execution target : {target.target_id} ({target.runtime}, backend={os.environ.get('HYPERLOOM_BENCHMARK_BACKEND', 'magpie')})"
+    )
     if target.runtime == "cuda":
         print(f"Optimization level: {args.optimization_level} (profile backend={args.profile_backend})")
 
@@ -1650,10 +1681,15 @@ async def _run_optimize(args: argparse.Namespace) -> int:
             sys.exit(2)
 
     os.environ["INFERENCE_OPTIMIZER_NODES"] = str(nodes_resolved)
-    # Multi-node topology handoff: export the CLI-flag-resolved backend / gpus-per-node so downstream subprocesses
-    # (kernel agent, benchmark, KB topology, state synthesis) read a single stable source.
-    if nodes_resolved >= 2:
+    # Multi-node topology handoff: export the CLI-flag-resolved backend /
+    # gpus-per-node so downstream subprocesses (kernel agent, benchmark, KB
+    # topology, state synthesis) read a single stable source. These are internal
+    # handoff envs, not a public config API; users pass --mn-backend /
+    # --gpus-per-node instead. The pod image is not among them: the platform
+    # builds the pods before the optimizer starts.
+    if nodes_resolved >= 2 or target.runtime == "cuda":
         os.environ["INFERENCE_OPTIMIZER_GPUS_PER_NODE"] = str(gpus_per_node_resolved)
+    if nodes_resolved >= 2:
         os.environ["INFERENCE_OPTIMIZER_MN_BACKEND"] = _resolve_mn_backend(args)
     _export_operator_launch_shape(
         server_args=str(getattr(args, "server_args", "") or "").strip(),
@@ -1801,6 +1837,10 @@ async def _run_optimize(args: argparse.Namespace) -> int:
             )
             sys.exit(2)
         state = SharedState.load_or_init(session_dir)
+        if target.runtime == "cuda":
+            state.target_runtime = target.runtime
+            state.device_pool = list(hardware_fingerprint["devices"])
+            state.hardware_fingerprint = hardware_fingerprint
         if state.target_id != target.target_id:
             print(
                 f"ERROR: resume target mismatch: state={state.target_id!r}, active={target.target_id!r}",
@@ -2115,7 +2155,9 @@ async def _run_optimize(args: argparse.Namespace) -> int:
             os.environ.pop("TARGET_GPU_TYPE", None)
             os.environ.pop("GPU_TYPE", None)
             args.gpu_type = None
-            print(f"GPU target      : {target.expected_gpu_count}x {target.expected_gpu_name}")
+            print(
+                "GPU pool        : " + ", ".join(f"{r['name']} ({r['uuid']})" for r in hardware_fingerprint["devices"])
+            )
         else:
             # Resolve real AMD board: probe > --gpu-type hint.
             user_specified = (args.gpu_type or os.environ.get("GPU_TYPE", "")).strip().lower()

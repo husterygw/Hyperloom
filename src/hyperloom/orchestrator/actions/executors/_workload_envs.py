@@ -1373,17 +1373,16 @@ def materialize_config_with_envs(
         envs.pop("PP", None)
 
     if target_runtime == "cuda":
-        cuda_env = os.environ.get("CUDA_VISIBLE_DEVICES")
-        cuda_yaml = str(envs.get("CUDA_VISIBLE_DEVICES") or "").strip()
-        if cuda_env is not None:
-            cuda_yaml = cuda_env.strip()
-        cuda_devices = [d.strip() for d in cuda_yaml.split(",") if d.strip()]
-        if cuda_yaml and len(cuda_devices) < world_size:
-            raise ValueError(
-                f"CUDA_VISIBLE_DEVICES={cuda_yaml!r} exposes {len(cuda_devices)} devices "
-                f"but TP*PP={resolved_tp}*{resolved_pp}={world_size}"
-            )
-        envs["CUDA_VISIBLE_DEVICES"] = cuda_yaml or ",".join(str(i) for i in range(world_size))
+        from hyperloom.inference_optimizer.target_registry import allocate_cuda_devices
+        import json
+
+        fingerprint = json.loads(os.environ.get("HYPERLOOM_HARDWARE_FINGERPRINT", "{}"))
+        selected = allocate_cuda_devices(
+            fingerprint,
+            world_size,
+            str(envs["CUDA_VISIBLE_DEVICES"]) if "CUDA_VISIBLE_DEVICES" in envs else None,
+        )
+        envs["CUDA_VISIBLE_DEVICES"] = ",".join(row["uuid"] for row in selected)
         envs.pop("ROCR_VISIBLE_DEVICES", None)
         envs.pop("HIP_VISIBLE_DEVICES", None)
         bench.pop("runner_type", None)

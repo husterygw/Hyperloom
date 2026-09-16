@@ -182,6 +182,13 @@ def detect_gpu_count() -> int:
             count parsed from ``rocm-smi``; 0 when nothing can be probed.
     """
     runtime = os.environ.get("HYPERLOOM_TARGET_RUNTIME", "rocm").strip().lower()
+    if runtime == "cuda":
+        try:
+            from ..bus.gpu_pool import resolve_whole_machine_devices
+
+            return len(resolve_whole_machine_devices())
+        except ValueError:
+            return 0
     mask_order = (
         ("CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES")
         if runtime == "cuda"
@@ -199,13 +206,6 @@ def detect_gpu_count() -> int:
             return len(ids)
     import subprocess
 
-    if runtime == "cuda":
-        try:
-            from hyperloom.inference_optimizer.target_registry import discover_nvidia_devices
-
-            return len(discover_nvidia_devices())
-        except Exception:  # noqa: BLE001 - best-effort capacity probe
-            return 0
     try:
         proc = subprocess.run(
             ["rocm-smi", "--showid"],
